@@ -1,0 +1,17 @@
+# 대회 데이터 (재배포 금지 — 각자 DACON에서 다운로드)
+Data/
+data/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# 대용량 산출물 (모델/제출물은 필요 시 선별 커밋)
+*.pkl
+*.joblib

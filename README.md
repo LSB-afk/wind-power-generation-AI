@@ -1,0 +1,93 @@
+# 제3회 풍력발전량 예측 AI 경진대회 - BARAM 2026
+
+기상청 기상예보 데이터(LDAPS, GFS)를 활용해 태백 가덕산/원동 풍력단지 3개 KPX 그룹의
+시간별 발전량(kWh)을 예측하는 대회 워크스페이스입니다.
+
+- 대회 링크: https://dacon.io/competitions/official/236727/overview/description
+- 대회 기간: 2026.07.06 ~ 2026.08.14 (1차 제출 마감 08.14 10:00)
+
+## 예측 대상
+
+| 그룹 | 터빈 | 설비용량 | 1시간 환산 |
+|---|---|---:|---:|
+| `kpx_group_1` | VESTAS V126 1~6호기 | 21.6 MW | 21,600 kWh |
+| `kpx_group_2` | VESTAS V126 7~12호기 | 21.6 MW | 21,600 kWh |
+| `kpx_group_3` | UNISON U136 1~5호기 | 21.0 MW | 21,000 kWh |
+
+- 위치: 강원 태백 가덕산/원동 (허브고도 117 m)
+- 예측 기간: 2025-01-01 01:00 ~ 2026-01-01 00:00 (8,760시간)
+
+## 평가 산식
+
+`총점 = 0.5 × (1 - NMAE) + 0.5 × FICR`
+
+- 실제 발전량이 **설비용량의 10% 이상**인 시간대만 평가
+- NMAE: `mean(|예측 - 실제| / 그룹 설비용량)` 의 3그룹 평균
+- FICR(정산금획득률): 시간별 예측오차율(설비용량 대비 %) 구간별 정산단가를 적용한
+  획득 정산금 / 이론상 최대 정산금 (`src/metrics.py` 참고)
+
+## 데이터 배치
+
+대회 데이터는 재배포 금지이므로 git에 포함하지 않습니다.
+DACON에서 다운로드 후 아래 구조로 배치하세요.
+
+```
+Data/
+├── info.xlsx
+├── data_description.md
+├── sample_submission.csv
+├── train/
+│   ├── ldaps_train.csv      # LDAPS 예보 (16격자, 2022~2024)
+│   ├── gfs_train.csv        # GFS 예보 (9격자, 2022~2024)
+│   ├── train_labels.csv     # 그룹별 실제 발전량 (그룹3은 2023년부터)
+│   ├── scada_vestas_train.csv
+│   └── scada_unison_train.csv
+└── test/
+    ├── ldaps_test.csv       # 2025년 LDAPS 예보
+    └── gfs_test.csv         # 2025년 GFS 예보
+```
+
+## 실행 방법
+
+```bash
+pip install -r requirements.txt
+
+# 1) 학습: 2024 홀드아웃 검증 후 전체 데이터로 재학습, models/에 저장
+python src/train.py
+
+# 2) 추론: 2025년 예측 → submissions/submission.csv 생성
+python src/inference.py
+```
+
+대회 규정에 따라 **학습(train.py)과 추론(inference.py) 코드는 분리**되어 있습니다.
+
+## 접근 방법 (베이스라인)
+
+- **피처**: LDAPS 16격자 / GFS 9격자의 풍속(u,v → 속력·풍향), 허브고도 인접 고도
+  (GFS 80/100 m) 풍속, 돌풍, 기온·기압(공기밀도 근사), 경계층 높이, 시간 주기성(sin/cos) 등
+- **모델**: 그룹별 LightGBM (L1 objective — NMAE 직접 최적화)
+- **검증**: 2022~2023 학습 → 2024 검증 (테스트와 동일한 '연 단위 미래 예측' 구조 재현)
+- **누수 방지**: 제공 예보 데이터는 전일 13:00(KST) 발표분만 포함되어 있어
+  예측기준시점 규칙을 자동 준수. 2025년 실측/사후 자료는 일절 미사용.
+
+## 향후 개선 아이디어
+
+- [ ] SCADA 풍속-출력 커브 학습 → 물리 기반 피처(터빈별 power curve) 추가
+- [ ] 격자 가중치: 터빈 좌표 기준 거리 가중 평균
+- [ ] FICR 특화 후처리 (오차율 6%/8% 구간 최적화)
+- [ ] 분위 회귀 앙상블, 시계열 CV 확장 (2023/2024 이중 폴드)
+- [ ] 외부 공개 데이터 (ASOS 관측 등 — 예측기준시점 규칙 준수 범위 내)
+
+## 저장소 구조
+
+```
+├── src/
+│   ├── config.py      # 경로·설비용량·상수
+│   ├── features.py    # LDAPS/GFS 피처 엔지니어링 (train/test 공용)
+│   ├── metrics.py     # NMAE, FICR, 대회 총점
+│   ├── train.py       # 학습 + 검증 + 모델 저장
+│   └── inference.py   # 추론 + 제출 파일 생성
+├── models/            # 학습된 LightGBM 모델 (.txt)
+├── submissions/       # 제출 CSV
+└── notebooks/         # EDA
+```
