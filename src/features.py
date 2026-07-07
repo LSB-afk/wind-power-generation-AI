@@ -17,9 +17,13 @@ def _wind_dir_sincos(u, v, prefix):
     return {f"{prefix}_wd_sin": np.sin(theta), f"{prefix}_wd_cos": np.cos(theta)}
 
 
-def build_ldaps_features(path) -> pd.DataFrame:
-    """LDAPS(1.5km, 16격자): 격자별 풍속 + 전체 격자 집계 피처."""
-    df = pd.read_csv(path, encoding="utf-8-sig", parse_dates=["forecast_kst_dtm"])
+def build_ldaps_features(path):
+    """LDAPS(1.5km, 16격자): 격자별 풍속 + 전체 격자 집계 피처.
+
+    반환: (피처 DataFrame, 예보 대상 시각별 data_available 시각 Series)
+    """
+    df = pd.read_csv(path, encoding="utf-8-sig",
+                     parse_dates=["forecast_kst_dtm", "data_available_kst_dtm"])
 
     # 격자별(행 단위) 파생: 풍속
     df["ws10"] = _wind_speed(df["heightAboveGround_10_10u"], df["heightAboveGround_10_10v"])
@@ -53,7 +57,9 @@ def build_ldaps_features(path) -> pd.DataFrame:
     agg = df.groupby("forecast_kst_dtm").agg(agg_vars)
     agg.columns = [f"ldaps_{c}_{s}" for c, s in agg.columns]
 
-    return wide.join(agg)
+    davail = df.drop_duplicates("forecast_kst_dtm").set_index(
+        "forecast_kst_dtm")["data_available_kst_dtm"]
+    return wide.join(agg), davail
 
 
 def build_gfs_features(path) -> pd.DataFrame:
@@ -108,10 +114,42 @@ def add_time_features(feat: pd.DataFrame) -> pd.DataFrame:
     return feat
 
 
-def build_features(ldaps_path, gfs_path) -> pd.DataFrame:
+# 컨텍스트(발표분 내 시계열) 피처 대상 컬럼
+CONTEXT_COLS = [
+    "ldaps_ws10_mean", "ldaps_ws10_max", "ldaps_ws50max_mean", "ldaps_blws_mean",
+    "gfs_ws100_mean", "gfs_ws80_mean", "gfs_ws100_cube_mean",
+    "gfs_surface_0_gust_mean", "gfs_ws_pbl_mean",
+]
+
+
+def add_context(feat: pd.DataFrame, davail: pd.Series) -> pd.DataFrame:
+    """같은 발표분(data_available) 24시간 블록 내 lag/lead/rolling.
+
+    블록 경계는 NaN — 다른 발표분(미래 공개 예보) 정보가 섞이지 않아 누수가 없다.
+    """
+    feat = feat.copy()
+    block = davail.reindex(feat.index)
+    new_cols = {}
+    for c in CONTEXT_COLS:
+        if c not in feat.columns:
+            continue
+        g = feat[c].groupby(block)
+        for s in (-2, -1, 1, 2):
+            new_cols[f"{c}_sh{s}"] = g.shift(s)
+        for w in (3, 6):
+            roll = g.rolling(w, center=True, min_periods=2)
+            new_cols[f"{c}_rm{w}"] = roll.mean().reset_index(level=0, drop=True)
+            new_cols[f"{c}_rs{w}"] = roll.std().reset_index(level=0, drop=True)
+        new_cols[f"{c}_d1"] = feat[c] - g.shift(1)
+    return pd.concat([feat, pd.DataFrame(new_cols, index=feat.index)], axis=1)
+
+
+def build_features(ldaps_path, gfs_path, context: bool = True) -> pd.DataFrame:
     """예보 대상 시각(forecast_kst_dtm) 인덱스의 피처 테이블 생성."""
-    ldaps = build_ldaps_features(ldaps_path)
+    ldaps, davail = build_ldaps_features(ldaps_path)
     gfs = build_gfs_features(gfs_path)
     feat = ldaps.join(gfs, how="outer")
     feat = add_time_features(feat)
+    if context:
+        feat = add_context(feat, davail)
     return feat.sort_index()
