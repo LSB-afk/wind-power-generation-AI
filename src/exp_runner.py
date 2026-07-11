@@ -150,11 +150,15 @@ def train_predict(tr, va, feature_cols, target, cap, params=None, seeds=(RANDOM_
     return np.mean(preds, axis=0), model.best_iteration
 
 
-def run_fold(data, feature_cols, train_years, valid_year, groups=GROUPS, **kw):
+def run_fold(data, feature_cols, train_years, valid_year, groups=GROUPS,
+             bad_mask=None, **kw):
     preds, actuals = {}, {}
     for g in groups:
         d = data.dropna(subset=[g])
         tr = d[d.index.year.isin(train_years)]
+        if bad_mask is not None:
+            # SCADA 정지/불일치 시간대는 학습에서만 제외 (검증은 전체)
+            tr = tr[~bad_mask[f"{g}_bad"].reindex(tr.index).fillna(False)]
         va = d[d.index.year == valid_year]
         pred, _ = train_predict(tr, va, feature_cols, g, CAPACITY_KWH[g], **kw)
         preds[g] = np.clip(pred, 0, CAPACITY_KWH[g])
@@ -386,6 +390,68 @@ def stage3(data, cols):
     print(f"\n[최종조합] {msg}")
 
 
+def stage5(datasets):
+    """v4: 이중 폴드(22→23, 22-23→24) 견고성 실험.
+
+    v2/v3의 Public 전이 실패 교훈: 단일 폴드(2024)에서만 이긴 것은 채택하지 않는다.
+    안전 하한 floor=0.10cap은 평가 필터(실발전 >= 10%cap) 정의상 어떤 해에도
+    채점 시간대를 악화시킬 수 없는 무손실 후처리이므로 항상 적용 가능.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    data_base, cols_base = datasets["base"]
+    data, cols = datasets["ctx"]
+    bad = pd.read_parquet(CACHE / "scada_badmask.parquet")
+    g12 = ["kpx_group_1", "kpx_group_2"]
+
+    def floor10(preds):
+        return {g: apply_post(p, CAPACITY_KWH[g], 1.0, 0.10 * CAPACITY_KWH[g])
+                for g, p in preds.items()}
+
+    def dual_eval(name, kw, use_base=False, post=False):
+        d, c = (data_base, cols_base) if use_base else (data, cols)
+        p24, a24 = run_fold(d, c, [2022, 2023], 2024, **kw)
+        p23, a23 = run_fold(d, c, [2022], 2023, groups=g12, **kw)
+        if post:
+            p24, p23 = floor10(p24), floor10(p23)
+        s24, m24 = score_str(p24, a24)
+        s23, m23 = score_str(p23, a23, g12)
+        per_g = " ".join(f"g{g[-1]}={group_score(p24[g], a24[g], CAPACITY_KWH[g]):.4f}"
+                         for g in GROUPS)
+        print(f"[{name}] fold24 {m24} | fold23 {m23}\n         fold24 그룹별: {per_g}")
+        return p24, a24, s24, s23
+
+    print("=== stage5: 이중 폴드 견고성 실험 ===")
+    dual_eval("R0_v1레시피(L1+base)", {}, use_base=True)
+    dual_eval("R1_L1+ctx", {})
+    dual_eval("R2_R1+SCADA클리닝", dict(bad_mask=bad))
+    p24_r3, a24, _, _ = dual_eval("R3_R2+floor10", dict(bad_mask=bad), post=True)
+    dual_eval("R4_q60+filter05+클리닝+floor10",
+              dict(bad_mask=bad, train_filter_ratio=0.05,
+                   params=dict(BASE_PARAMS, objective="quantile", alpha=0.60)),
+              post=True)
+
+    # R5: HistGB(absolute_error) 블렌드 — 모델 다양성 (R3 위에)
+    print("--- R5: LGBM+HistGB 블렌드 (fold24/23) ---")
+    for years_tr, year_va, groups in ([[2022, 2023], 2024, GROUPS], [[2022], 2023, g12]):
+        preds_l, actuals = run_fold(data, cols, years_tr, year_va, groups=groups, bad_mask=bad)
+        preds_b = {}
+        for g in groups:
+            d = data.dropna(subset=[g])
+            tr = d[d.index.year.isin(years_tr)]
+            tr = tr[~bad[f"{g}_bad"].reindex(tr.index).fillna(False)]
+            va = d[d.index.year == year_va]
+            hgb = HistGradientBoostingRegressor(
+                loss="absolute_error", max_iter=2000, learning_rate=0.05,
+                max_leaf_nodes=63, early_stopping=True, n_iter_no_change=50,
+                random_state=RANDOM_SEED)
+            hgb.fit(tr[cols], tr[g])
+            pb = np.clip(hgb.predict(va[cols]), 0, CAPACITY_KWH[g])
+            preds_b[g] = np.clip(0.5 * preds_l[g] + 0.5 * pb, 0, CAPACITY_KWH[g])
+        s, msg = score_str(floor10(preds_b), actuals, groups)
+        print(f"  fold{str(year_va)[-2:]}: {msg}")
+
+
 FINAL_RECIPE = dict(train_filter_ratio=0.05,
                     params=dict(BASE_PARAMS, objective="quantile", alpha=0.60))
 
@@ -492,9 +558,11 @@ def main():
     elif mode == "stage3":
         data, cols = dataset(feat_ctx)
         stage3(data, cols)
-    else:
+    elif mode == "stage4":
         data, cols = dataset(feat_ctx)
         stage4(data, cols)
+    else:
+        stage5({"base": dataset(base_feat), "ctx": dataset(feat_ctx)})
 
 
 if __name__ == "__main__":
