@@ -1,12 +1,13 @@
 """학습 스크립트 (대회 규정: 추론 코드와 분리).
 
-최종 레시피 (2024 홀드아웃 검증 총점 0.6438, 기준선 0.5968):
+최종 레시피 (2024 홀드아웃 검증 총점 0.6457, 기준선 0.5968):
 - 피처: LDAPS/GFS 격자·집계 + 발표분 내 컨텍스트(lag/lead/rolling)
 - 목적함수: quantile(alpha=0.60) — 평가 필터로 인한 저편향 보정
 - 학습 필터: 실제 발전량 < 설비용량 5% 시간대 제외 (평가 대상과 정렬)
 - 그룹1/2: 단독 모델, 그룹3: 3그룹 통합(pooled) 학습 (라벨 1년 부족 보완)
 - 3시드 앙상블 (42, 202, 777)
-- 후처리: 그룹별 (scale, floor) — 홀드아웃에서 튜닝, 연도 간 이전성 검증됨
+- 후처리: 그룹별 (scale, floor) — 홀드아웃에서 튜닝하되, 그룹1/2는
+  23·24년 평균보다 덜 공격적이고 24년 점수가 낮지 않은 24년 직접 튜닝값 채택
 
 절차:
 1) 2022~23 학습 → 2024 홀드아웃으로 검증 점수·후처리 파라미터·트리 수 산출
@@ -102,7 +103,8 @@ def main():
     preds24[G3] = np.clip(g3_pred * cap3, 0, cap3)
     actuals24[G3] = (pva["y_norm"] * cap3).to_numpy()
 
-    # 후처리: 그룹1/2는 2023·2024 양년 튜닝 평균(연도 노이즈 헤지), 그룹3은 2024 튜닝
+    # 후처리: 그룹1/2는 23·24년 평균과 24년 직접 튜닝을 비교한다.
+    # Public LB에서 FICR 전이가 약했으므로, 24년 점수가 낮지 않다면 더 낮은 scale/floor를 택한다.
     post = {}
     for g in G12:
         cap = CAPACITY_KWH[g]
@@ -110,7 +112,13 @@ def main():
         tX, ty, va23, a23 = _solo_split(data, cols, g, [2022], 2023)
         p23, _ = _fit_predict(tX, ty, va23, LGB_PARAMS)
         _, sc23, fl23 = tune_post(np.clip(p23, 0, cap), a23, cap)
-        post[g] = ((sc24 + sc23) / 2, (fl24 + fl23) / 2)
+        sc_avg, fl_avg = (sc24 + sc23) / 2, (fl24 + fl23) / 2
+        s24 = group_score(apply_post(preds24[g], cap, sc24, fl24), actuals24[g], cap)
+        s_avg = group_score(apply_post(preds24[g], cap, sc_avg, fl_avg), actuals24[g], cap)
+        if sc24 <= sc_avg and fl24 <= fl_avg and s24 >= s_avg:
+            post[g] = (sc24, fl24)
+        else:
+            post[g] = (sc_avg, fl_avg)
     _, sc3, fl3 = tune_post(preds24[G3], actuals24[G3], cap3)
     post[G3] = (sc3, fl3)
 

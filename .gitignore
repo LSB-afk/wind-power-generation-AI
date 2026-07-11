@@ -18,3 +18,6 @@ venv/
 
 # 실험용 피처 캐시
 cache/
+
+# Local OMX workflow state
+.omx/

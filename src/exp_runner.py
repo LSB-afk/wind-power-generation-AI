@@ -429,7 +429,8 @@ def stage4(data, cols):
     s_raw, msg = score_str(p24, a24)
     print(f"[최종레시피 3시드 raw] {msg}")
 
-    # 후처리 파라미터: 2024 튜닝 vs 2023 튜닝 → 평균 파라미터 비교 (그룹1/2)
+    # 후처리 파라미터: Public LB에서 FICR 전이가 약했으므로 그룹1/2는
+    # 2024 직접 튜닝값이 23·24 평균보다 덜 공격적이고 점수가 낮지 않으면 직접값을 채택한다.
     p23, a23 = run_fold(data, cols, [2022], 2023, groups=g12, seeds=SEEDS3, **FINAL_RECIPE)
     post = {}
     for g in GROUPS:
@@ -440,9 +441,16 @@ def stage4(data, cols):
             sc_avg, fl_avg = (sc24 + sc23) / 2, (fl24 + fl23) / 2
             s_with24 = group_score(apply_post(p24[g], cap, sc24, fl24), a24[g], cap)
             s_withavg = group_score(apply_post(p24[g], cap, sc_avg, fl_avg), a24[g], cap)
+            if sc24 <= sc_avg and fl24 <= fl_avg and s_with24 >= s_withavg:
+                chosen = (sc24, fl24)
+                reason = "24직접"
+            else:
+                chosen = (sc_avg, fl_avg)
+                reason = "23·24평균"
             print(f"  {g}: 24튜닝(sc={sc24:.2f},fl={fl24/cap:.3f})={s_with24:.4f}  "
-                  f"평균(sc={sc_avg:.2f},fl={fl_avg/cap:.3f})={s_withavg:.4f}")
-            post[g] = (sc_avg, fl_avg)  # 연도 간 노이즈 헤지
+                  f"평균(sc={sc_avg:.2f},fl={fl_avg/cap:.3f})={s_withavg:.4f}  "
+                  f"→ 채택={reason}")
+            post[g] = chosen
         else:
             # 그룹3: 2024 상/하반기 교차 안정성 확인
             n = len(g3_pred)
