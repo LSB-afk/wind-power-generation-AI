@@ -36,14 +36,62 @@ def _hourly(d: pd.DataFrame, prefix: str, turbines) -> pd.DataFrame:
     return pd.DataFrame({"scada_kwh": energy, "n_stopped": n_stopped})
 
 
-def build_bad_mask(labels: pd.DataFrame) -> pd.DataFrame:
-    """라벨 인덱스(kst_dtm) 기준 그룹별 '{group}_bad' 불리언 마스크."""
-    scada = {
+def _load_scada():
+    return {
         "vestas": pd.read_csv(TRAIN_DIR / "scada_vestas_train.csv", encoding="utf-8-sig",
                               parse_dates=["kst_dtm"]).set_index("kst_dtm").sort_index(),
         "unison": pd.read_csv(TRAIN_DIR / "scada_unison_train.csv", encoding="utf-8-sig",
                               parse_dates=["kst_dtm"]).set_index("kst_dtm").sort_index(),
     }
+
+
+def build_potential(labels: pd.DataFrame) -> pd.DataFrame:
+    """가용률 보정 발전량(potential) 재구성.
+
+    정지 터빈 시간대를 버리는 대신, 10분 단위로
+    potential = (정상 터빈 에너지 합 / 정상 대수) x 전체 대수
+    로 환산해 '전 터빈 가동 시 발전량'을 근사한다 (그룹 내 동일 기종 전제).
+
+    정상 터빈 = 출력 > 1 kWh 또는 자체 풍속 < 5 m/s (저풍속 무출력은 정상).
+    정상 대수 < 전체의 절반이면 NaN (신뢰 불가). 라벨-SCADA 불일치 시간대는
+    별도 마스크(build_bad_mask)로 계속 제외한다.
+    """
+    scada = _load_scada()
+    out = {}
+    for g, (maker, turbines) in _GROUP_TURBINES.items():
+        d = scada[maker]
+        n = len(list(turbines))
+        pw = d[[f"{maker}_wtg{t:02d}_power_kw10m" for t in turbines]]
+        ws = d[[f"{maker}_wtg{t:02d}_ws" for t in turbines]]
+        pw = pw.where((pw >= -100) & (pw <= 800))
+        ws = ws.where((ws >= 0) & (ws <= 60))
+        ok = (pw.values > 1) | (ws.values < 5.0)
+        ok &= pw.notna().values
+        e_ok = np.where(ok, np.nan_to_num(pw.values, nan=0.0), 0.0).sum(axis=1)
+        n_ok = ok.sum(axis=1)
+        pot10 = np.where(n_ok >= max(n // 2, 2), e_ok / np.maximum(n_ok, 1) * n, np.nan)
+        cap10 = CAPACITY_KWH[g] / 6.0
+        pot10 = np.clip(pot10, 0, cap10)
+        hour_end = d.index.ceil("h")
+        pot = pd.Series(pot10, index=d.index).groupby(hour_end).mean() * 6.0
+        out[f"{g}_potential"] = pot.reindex(labels.index)
+    return pd.DataFrame(out, index=labels.index)
+
+
+def build_mismatch_mask(labels: pd.DataFrame) -> pd.DataFrame:
+    """라벨-SCADA 계측 불일치(>5%cap) 마스크 — potential 라벨 사용 시 제외 대상."""
+    scada = _load_scada()
+    out = {}
+    for g, (maker, turbines) in _GROUP_TURBINES.items():
+        agg = _hourly(scada[maker], maker, turbines)
+        j = labels[[g]].join(agg, how="left")
+        out[f"{g}_mismatch"] = (np.abs(j[g] - j["scada_kwh"]) / CAPACITY_KWH[g] > 0.05).fillna(False)
+    return pd.DataFrame(out, index=labels.index)
+
+
+def build_bad_mask(labels: pd.DataFrame) -> pd.DataFrame:
+    """라벨 인덱스(kst_dtm) 기준 그룹별 '{group}_bad' 불리언 마스크."""
+    scada = _load_scada()
     out = {}
     for g, (maker, turbines) in _GROUP_TURBINES.items():
         agg = _hourly(scada[maker], maker, turbines)

@@ -452,6 +452,139 @@ def stage5(datasets):
         print(f"  fold{str(year_va)[-2:]}: {msg}")
 
 
+def stage6(datasets):
+    """v5 후보 실험 — 이중 폴드(22→23, 22-23→24) 일관 승리만 채택.
+
+    T1: potential 라벨(가용률 보정) — 정지 시간대를 버리지 않고 복원
+    T2: 그룹1/2도 통합(pooled) 학습
+    T3: 분위 앙상블 (alpha 0.55/0.60/0.65 평균)
+    T4: 스프레드/불확실성 피처 팩
+    """
+    data, cols = datasets["ctx"]
+    bad = pd.read_parquet(CACHE / "scada_badmask.parquet")
+    mism = pd.read_parquet(CACHE / "scada_mismatch.parquet")
+    pot = pd.read_parquet(CACHE / "scada_potential.parquet")
+    g12 = ["kpx_group_1", "kpx_group_2"]
+    Q60 = dict(BASE_PARAMS, objective="quantile", alpha=0.60)
+
+    def floor10(preds):
+        return {g: apply_post(p, CAPACITY_KWH[g], 1.0, 0.10 * CAPACITY_KWH[g])
+                for g, p in preds.items()}
+
+    def report(name, p24, a24, p23, a23):
+        s24, m24 = score_str(floor10(p24), a24)
+        s23, m23 = score_str(floor10(p23), a23, g12)
+        per_g = " ".join(f"g{g[-1]}={group_score(floor10(p24)[g], a24[g], CAPACITY_KWH[g]):.4f}"
+                         for g in GROUPS)
+        print(f"[{name}] fold24 {m24} | fold23 {m23}\n         fold24 그룹별: {per_g}")
+
+    def v4_fold(train_years, valid_year, groups, params=None, seeds=(RANDOM_SEED,)):
+        return run_fold(data, cols, train_years, valid_year, groups=groups, bad_mask=bad,
+                        train_filter_ratio=0.05, params=params or Q60, seeds=seeds)
+
+    # ── T0: v4 기준선 재계측 ──
+    p24, a24 = v4_fold([2022, 2023], 2024, GROUPS)
+    p23, a23 = v4_fold([2022], 2023, g12)
+    report("T0_v4기준선", p24, a24, p23, a23)
+
+    # ── T1: potential 라벨 (a: 가용률 계수 적용 / b: 미적용) ──
+    def potential_fold(train_years, valid_year, groups, use_avail):
+        preds, actuals = {}, {}
+        for g in groups:
+            cap = CAPACITY_KWH[g]
+            y_pot = pot[f"{g}_potential"]
+            d = data.dropna(subset=[g])
+            tr = d[d.index.year.isin(train_years)].copy()
+            tr["_y"] = y_pot.reindex(tr.index)
+            tr = tr[~mism[f"{g}_mismatch"].reindex(tr.index).fillna(False)]
+            tr = tr.dropna(subset=["_y"])
+            tr = tr[tr["_y"] >= 0.05 * cap]
+            va = d[d.index.year == valid_year]
+            avail = 1.0
+            if use_avail:
+                m = (~mism[f"{g}_mismatch"].reindex(tr.index).fillna(False))
+                avail = float(tr.loc[m, g].sum() / tr.loc[m, "_y"].sum())
+            dtrain = lgb.Dataset(tr[cols], tr["_y"])
+            m2 = lgb.train(dict(Q60, seed=RANDOM_SEED), dtrain, 5000,
+                           valid_sets=[lgb.Dataset(va[cols], va[g], reference=dtrain)],
+                           callbacks=[lgb.early_stopping(200, verbose=False)])
+            pred = m2.predict(va[cols], num_iteration=m2.best_iteration) * avail
+            preds[g] = np.clip(pred, 0, cap)
+            actuals[g] = va[g].to_numpy()
+        return preds, actuals
+
+    for label, use_avail in (("T1a_potential+가용률계수", True), ("T1b_potential(계수없음)", False)):
+        q24, b24 = potential_fold([2022, 2023], 2024, GROUPS, use_avail)
+        q23, b23 = potential_fold([2022], 2023, g12, use_avail)
+        report(label, q24, b24, q23, b23)
+
+    # ── T2: 그룹1/2도 pooled ──
+    def pooled_fold(train_years, valid_year, groups):
+        frames = []
+        for g in GROUPS:
+            d = data.dropna(subset=[g])
+            d = d[~bad[f"{g}_bad"].reindex(d.index).fillna(False)]
+            f = d[cols].copy()
+            f["y_norm"] = d[g] / CAPACITY_KWH[g]
+            f["gid"] = int(g[-1])
+            frames.append(f)
+        pooled = pd.concat(frames)
+        pcols = cols + ["gid"]
+        ptr = pooled[pooled.index.year.isin(train_years)]
+        ptr = ptr[ptr["y_norm"] >= 0.05]
+        preds, actuals = {}, {}
+        for g in groups:
+            cap = CAPACITY_KWH[g]
+            d = data.dropna(subset=[g])
+            va = d[d.index.year == valid_year]
+            va_X = va[cols].copy(); va_X["gid"] = int(g[-1])
+            dtrain = lgb.Dataset(ptr[pcols], ptr["y_norm"], categorical_feature=["gid"])
+            m = lgb.train(dict(Q60, seed=RANDOM_SEED), dtrain, 5000,
+                          valid_sets=[lgb.Dataset(va_X[pcols], va[g] / cap, reference=dtrain)],
+                          callbacks=[lgb.early_stopping(200, verbose=False)])
+            preds[g] = np.clip(m.predict(va_X[pcols], num_iteration=m.best_iteration) * cap, 0, cap)
+            actuals[g] = va[g].to_numpy()
+        return preds, actuals
+
+    r24, c24 = pooled_fold([2022, 2023], 2024, GROUPS)
+    r23, c23 = pooled_fold([2022], 2023, g12)
+    report("T2_전그룹pooled", r24, c24, r23, c23)
+
+    # ── T3: 분위 앙상블 (0.55/0.60/0.65) ──
+    def alpha_fold(train_years, valid_year, groups):
+        acc = None
+        for al in (0.55, 0.60, 0.65):
+            p, a = v4_fold(train_years, valid_year, groups,
+                           params=dict(BASE_PARAMS, objective="quantile", alpha=al))
+            acc = p if acc is None else {g: acc[g] + p[g] for g in groups}
+        return {g: acc[g] / 3 for g in groups}, a
+
+    s24, d24 = alpha_fold([2022, 2023], 2024, GROUPS)
+    s23, d23 = alpha_fold([2022], 2023, g12)
+    report("T3_분위앙상블", s24, d24, s23, d23)
+
+    # ── T4: 스프레드/불확실성 피처 팩 ──
+    feat2 = data[cols].copy()
+    eps = 0.1
+    feat2["x_spread_ws"] = feat2["gfs_ws100_mean"] - feat2["ldaps_ws50max_mean"]
+    feat2["x_spread_ws10"] = feat2["gfs_ws10_mean"] - feat2["ldaps_ws10_mean"]
+    feat2["x_cv_gfs"] = feat2["gfs_ws100_std"] / (feat2["gfs_ws100_mean"] + eps)
+    feat2["x_cv_ldaps"] = feat2["ldaps_ws10_std"] / (feat2["ldaps_ws10_mean"] + eps)
+    sin_cols = [c for c in cols if c.startswith("gfs_g") and c.endswith("d100_wd_sin")]
+    cos_cols = [c for c in cols if c.startswith("gfs_g") and c.endswith("d100_wd_cos")]
+    feat2["x_wd_sin"] = feat2[sin_cols].mean(axis=1)
+    feat2["x_wd_cos"] = feat2[cos_cols].mean(axis=1)
+    feat2["x_ws_x_sin"] = feat2["gfs_ws100_mean"] * feat2["x_wd_sin"]
+    feat2["x_ws_x_cos"] = feat2["gfs_ws100_mean"] * feat2["x_wd_cos"]
+    data2 = feat2.join(data[GROUPS])
+    cols2 = list(feat2.columns)
+    t24, e24 = run_fold(data2, cols2, [2022, 2023], 2024, bad_mask=bad,
+                        train_filter_ratio=0.05, params=Q60)
+    t23, e23 = run_fold(data2, cols2, [2022], 2023, groups=g12, bad_mask=bad,
+                        train_filter_ratio=0.05, params=Q60)
+    report("T4_피처팩", t24, e24, t23, e23)
+
+
 FINAL_RECIPE = dict(train_filter_ratio=0.05,
                     params=dict(BASE_PARAMS, objective="quantile", alpha=0.60))
 
@@ -561,8 +694,10 @@ def main():
     elif mode == "stage4":
         data, cols = dataset(feat_ctx)
         stage4(data, cols)
-    else:
+    elif mode == "stage5":
         stage5({"base": dataset(base_feat), "ctx": dataset(feat_ctx)})
+    else:
+        stage6({"ctx": dataset(feat_ctx)})
 
 
 if __name__ == "__main__":
