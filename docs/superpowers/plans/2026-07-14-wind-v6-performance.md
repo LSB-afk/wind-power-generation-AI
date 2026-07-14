@@ -217,20 +217,26 @@ commit with Lore trailers.
   with identical raw sources, features, validation targets, seeds, and post-processing.
 - Default `python src/exp_runner.py stage7` prints one final JSON result and exits `0` only when
   `gate_scores()` passes.
+- Fold provenance/cache records each model family's ordered per-seed `best_iteration` values.
+- A canonical, atomically written final-gate artifact under `.omx/experiments/wind-v6/` records
+  schema/recipe/feature/source hashes, seeds, fold/group metrics and deltas, manifest keys,
+  fold24 candidate best iterations, and `PASS`; a SHA-256 sidecar binds the exact JSON bytes.
 
 - [ ] **Step 1: Write the final-route and result-contract tests**
 
 Assert default stage7 selects only the weighted recipe, reports per-fold/per-group NMAE and FICR,
 compares exact actual targets, and returns non-zero for either-fold regression or mean gain below
-`0.0010`.
+`0.0010`. Assert fit caches preserve ordered per-seed best iterations and the canonical artifact is
+written only for the exact three seeds and a passing gate; reject malformed/tampered artifacts.
 
 - [ ] **Step 2: Run the canonical three-seed evaluator**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python src/exp_runner.py stage7`
 
 Expected: exit `0`, both deltas positive, mean delta at least `0.0010`, and final JSON status
-`PASS`. If this fails, stop promotion and use only the bounded contingency candidates documented
-in the design; do not weaken the gate.
+`PASS`. The final-gate JSON and SHA-256 sidecar must match the printed result and contain all
+fold24 candidate best iterations. If this fails, stop promotion and use only the bounded
+contingency candidates documented in the design; do not weaken the gate.
 
 - [ ] **Step 3: Run regression/static checks**
 

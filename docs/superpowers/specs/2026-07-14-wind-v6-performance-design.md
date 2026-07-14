@@ -79,6 +79,13 @@ must import the same target builder.
 4. print per-fold, per-group, NMAE, FICR, score, deltas, and a final PASS/FAIL result;
 5. exit non-zero when the performance contract is not met.
 
+The exact three-seed passing result is also persisted atomically as a hash-bound final-gate
+artifact. It includes ordered per-seed validation `best_iteration` values for each candidate model
+family. Full-data training preserves the existing refit policy separately from evaluator parity:
+truncate the mean fold24 best iteration, multiply by `1.2`, truncate again, and use at least 100
+rounds for every seed in that family. Production must recompute and verify this scalar from the
+gate artifact rather than copying it manually.
+
 The winning recipe will then be represented once in production training code and reused by
 inference through saved feature names, model names, ensemble weights, and post-processing
 metadata. This prevents the experiment/production drift present in v5.
