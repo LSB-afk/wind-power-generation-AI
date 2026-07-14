@@ -1393,7 +1393,9 @@ def test_default_stage7_runs_only_weighted_candidate_and_writes_canonical_gate(
     monkeypatch.setattr(v6_eval, "fold_metrics", metrics)
 
     assert v6_eval.run_stage7((42, 202, 777)) == 0
-    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    output = capsys.readouterr().out
+    final_line = output.splitlines(keepends=True)[-1]
+    result = json.loads(final_line)
 
     assert calls == [
         v6_eval.BASELINE_RECIPE,
@@ -1404,6 +1406,7 @@ def test_default_stage7_runs_only_weighted_candidate_and_writes_canonical_gate(
     assert result["candidate_recipe"] == v6_eval.WEIGHTED_RECIPE
     assert result["status"] == "PASS"
     assert artifact_path.is_file()
+    assert final_line.encode("utf-8") == artifact_path.read_bytes()
     assert result == json.loads(artifact_path.read_text(encoding="utf-8"))
     assert set(result["fold24_candidate_best_iterations"]) == {
         "kpx_group_1",

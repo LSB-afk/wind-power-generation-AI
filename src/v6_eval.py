@@ -1774,7 +1774,9 @@ def run_stage7(
                 expected_feature_hash=candidate24.provenance.feature_hash,
                 expected_source_hashes=candidate24.provenance.data_hashes,
             )
-        print(json.dumps(result, sort_keys=True))
+            sys.stdout.write(_canonical_json_bytes(result).decode("ascii"))
+        else:
+            print(json.dumps(result, sort_keys=True))
         return 0 if gate["status"] == "PASS" else 1
     except (
         ProvenanceError,
