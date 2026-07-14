@@ -1,5 +1,6 @@
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -48,6 +49,7 @@ def _synthetic_fold(
     postprocess_config: dict | None = None,
     row_counts: dict[str, int] | None = None,
     target_shift: float = 0.0,
+    best_iterations: dict[str, tuple[int, ...]] | None = None,
 ) -> FoldPredictions:
     group = "kpx_group_1"
     model_predictions = {
@@ -74,6 +76,8 @@ def _synthetic_fold(
         feature_hash=feature_fingerprint,
         data_hashes=data_hashes or {"labels": "labels-sha"},
         derived_data_hashes=derived_data_hashes or {"potential": "potential-sha"},
+        best_iterations=best_iterations
+        or {group: tuple(100 + offset for offset, _ in enumerate(seeds))},
         row_counts=row_counts or {"g1_train": 2, "g1_valid": len(index)},
         model_predictions=model_predictions,
         validation_targets=validation_targets,
@@ -228,7 +232,7 @@ def test_manifest_key_changes_with_seed_or_feature_name():
         "recipe": "v5-c1",
         "recipe_hash": "recipe-sha",
         "postprocess_hash": "postprocess-sha",
-        "cache_schema_version": 2,
+        "cache_schema_version": 3,
         "train_years": (2022,),
         "valid_year": 2023,
         "groups": ("kpx_group_1", "kpx_group_2"),
@@ -267,7 +271,7 @@ def test_candidate_cache_identity_covers_every_weighted_training_input(changed_h
         "recipe": WEIGHTED_RECIPE,
         "recipe_hash": "recipe-sha",
         "postprocess_hash": "post-sha",
-        "cache_schema_version": 2,
+        "cache_schema_version": 3,
         "train_years": (2022,),
         "valid_year": 2023,
         "groups": ("kpx_group_1", "kpx_group_2"),
@@ -410,7 +414,7 @@ def test_prediction_cache_manifest_contains_complete_provenance(tmp_path):
         "prediction_hashes",
     } <= manifest.keys()
     assert manifest["manifest_key"] == fold.provenance.manifest_key
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert (tmp_path / manifest["predictions_file"]).is_file()
 
 
@@ -495,6 +499,37 @@ def test_prediction_cache_returns_live_targets_and_rejects_live_drift(tmp_path):
     with pytest.raises(ProvenanceError, match="live validation index"):
         v6_eval._read_prediction_cache(
             **kwargs, live_validation_targets=changed_indexes
+        )
+
+
+def test_prediction_cache_rejects_tampered_best_iteration_evidence(tmp_path):
+    import v6_eval
+
+    fold = _synthetic_fold(
+        pd.date_range("2023-01-01", periods=2, freq="h"),
+        seeds=(42, 202, 777),
+        best_iterations={"kpx_group_1": (101, 102, 103)},
+    )
+    manifest_path = write_prediction_cache(fold, tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["best_iterations"]["kpx_group_1"][1] = 999
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ProvenanceError, match="prediction cache hashes"):
+        v6_eval._read_prediction_cache(
+            cache_dir=tmp_path,
+            recipe=fold.provenance.recipe,
+            train_years=fold.provenance.train_years,
+            valid_year=fold.provenance.valid_year,
+            groups=fold.provenance.groups,
+            seeds=fold.provenance.seeds,
+            recipe_fingerprint=fold.provenance.recipe_hash,
+            postprocess_config=fold.provenance.postprocess_config,
+            feature_fingerprint=fold.provenance.feature_hash,
+            data_hashes=fold.provenance.data_hashes,
+            derived_data_hashes=fold.provenance.derived_data_hashes,
+            row_counts=fold.provenance.row_counts,
+            live_validation_targets=fold.validation_targets,
         )
 
 
@@ -726,17 +761,22 @@ def test_score_fold_enforces_complete_fingerprint_for_baseline_recipe():
         score_fold(fold)
 
 
-def test_stage7_nonbaseline_path_fails_before_baseline_ok(monkeypatch, capsys):
+def test_stage7_default_path_enters_weighted_evaluation_without_baseline_ok(
+    monkeypatch, capsys
+):
     import v6_eval
 
-    monkeypatch.setattr(
-        v6_eval,
-        "fit_fold",
-        lambda *_args, **_kwargs: pytest.fail("baseline trained on nonbaseline path"),
-    )
+    calls = []
+
+    def reject(*args, **_kwargs):
+        calls.append(args)
+        raise ProvenanceError("sentinel baseline rejection")
+
+    monkeypatch.setattr(v6_eval, "fit_fold", reject)
 
     assert v6_eval.run_stage7((42,), baseline_only=False) == 2
     captured = capsys.readouterr()
+    assert calls and calls[0][0] == v6_eval.BASELINE_RECIPE
     assert "BASELINE_OK" not in captured.out
 
 
@@ -755,14 +795,14 @@ def test_stage7_converts_provenance_failure_to_code_2(monkeypatch, capsys):
 
 
 def test_stage7_weighted_screen_compares_aligned_baseline_and_candidate(
-    monkeypatch, capsys
+    monkeypatch, capsys, tmp_path
 ):
     import v6_eval
 
     calls = []
 
     class StubFold:
-        def __init__(self, recipe, valid_year):
+        def __init__(self, recipe, valid_year, groups, seeds):
             self.recipe = recipe
             self.valid_year = valid_year
             expected = (
@@ -776,12 +816,22 @@ def test_stage7_weighted_screen_compares_aligned_baseline_and_candidate(
                 {
                     "row_counts": expected[v6_eval._fold_name(valid_year)],
                     "manifest_key": f"{recipe}-{valid_year}",
+                    "best_iterations": {
+                        group: tuple(100 for _ in seeds)
+                        for group in groups
+                        if group in v6_eval.G12
+                    }
+                    | (
+                        {"pooled": tuple(200 for _ in seeds)}
+                        if v6_eval.G3 in groups
+                        else {}
+                    ),
                 },
             )()
 
     def fit(recipe, train_years, valid_year, groups, seeds):
         calls.append((recipe, train_years, valid_year, groups, seeds))
-        return StubFold(recipe, valid_year)
+        return StubFold(recipe, valid_year, groups, seeds)
 
     scores = {
         (v6_eval.BASELINE_RECIPE, 2023): 0.631623985226,
@@ -800,6 +850,9 @@ def test_stage7_weighted_screen_compares_aligned_baseline_and_candidate(
         lambda baseline, candidate: alignments.append((baseline, candidate)),
     )
     monkeypatch.setattr(v6_eval, "fold_metrics", lambda _fold: {"g": {}})
+    artifact_path = tmp_path / "final-gate.json"
+    artifact_path.write_bytes(b"existing-promotion-evidence\n")
+    monkeypatch.setattr(v6_eval, "FINAL_GATE_PATH", artifact_path)
 
     assert v6_eval.run_stage7((42,), screen="weighted") == 0
     output = capsys.readouterr().out.strip().splitlines()
@@ -815,6 +868,7 @@ def test_stage7_weighted_screen_compares_aligned_baseline_and_candidate(
     assert result["status"] == "PASS"
     assert result["candidate_recipe"] == v6_eval.WEIGHTED_RECIPE
     assert result["mean_delta"] == pytest.approx(0.001632482019)
+    assert artifact_path.read_bytes() == b"existing-promotion-evidence\n"
 
 
 def _stub_main_inputs(monkeypatch, exp_runner):
@@ -942,3 +996,435 @@ def test_main_rejects_unknown_mode_without_stage_fallback(monkeypatch, capsys):
     assert stage6_calls == []
     assert stage7_calls == []
     assert "stage7-extra" in capsys.readouterr().err
+
+
+def _best_iterations_hash(seeds, families):
+    payload = json.dumps(
+        {"families": families, "seeds": list(seeds)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _passing_final_gate_payload():
+    import v6_eval
+
+    seeds = [42, 202, 777]
+    sources = {
+        "gfs_train": "1" * 64,
+        "ldaps_train": "2" * 64,
+        "scada_unison": "3" * 64,
+        "scada_vestas": "4" * 64,
+        "train_labels": "5" * 64,
+    }
+    best_iterations = {
+        "kpx_group_1": [111, 112, 113],
+        "kpx_group_2": [211, 212, 213],
+        "pooled": [311, 312, 313],
+    }
+
+    def group_metrics(nmae, ficr):
+        return {
+            "nmae": nmae,
+            "ficr": ficr,
+            "score": 0.5 * (1.0 - nmae) + 0.5 * ficr,
+        }
+
+    fold23_baseline = {group: group_metrics(0.20, 0.40) for group in v6_eval.G12}
+    fold23_candidate = {group: group_metrics(0.198, 0.402) for group in v6_eval.G12}
+    fold24_baseline = {group: group_metrics(0.20, 0.40) for group in v6_eval.GROUPS}
+    fold24_candidate = {group: group_metrics(0.199, 0.401) for group in v6_eval.GROUPS}
+    return {
+        "kind": "wind-v6-final-gate",
+        "schema_version": 1,
+        "cache_schema_version": 3,
+        "status": "PASS",
+        "seeds": seeds,
+        "candidate_recipe": v6_eval.WEIGHTED_RECIPE,
+        "recipes": {
+            "baseline": v6_eval.BASELINE_RECIPE,
+            "candidate": v6_eval.WEIGHTED_RECIPE,
+        },
+        "hashes": {
+            "recipes": {
+                "baseline": v6_eval.recipe_fingerprint(v6_eval.BASELINE_RECIPE_CONFIG),
+                "candidate": v6_eval.recipe_fingerprint(v6_eval.WEIGHTED_RECIPE_CONFIG),
+            },
+            "postprocess": v6_eval.recipe_fingerprint(
+                v6_eval.BASELINE_POSTPROCESS_CONFIG
+            ),
+            "features": "6" * 64,
+            "sources": sources,
+        },
+        "folds": {
+            "fold23": {
+                "baseline": {
+                    "score": 0.60,
+                    "metrics": fold23_baseline,
+                    "manifest_key": "7" * 64,
+                },
+                "candidate": {
+                    "score": 0.602,
+                    "metrics": fold23_candidate,
+                    "manifest_key": "8" * 64,
+                },
+                "delta": 0.002,
+            },
+            "fold24": {
+                "baseline": {
+                    "score": 0.60,
+                    "metrics": fold24_baseline,
+                    "manifest_key": "9" * 64,
+                },
+                "candidate": {
+                    "score": 0.601,
+                    "metrics": fold24_candidate,
+                    "manifest_key": "a" * 64,
+                },
+                "delta": 0.001,
+            },
+        },
+        "mean_delta": 0.0015,
+        "fold24_candidate_best_iterations": best_iterations,
+        "fold24_candidate_best_iterations_hash": _best_iterations_hash(
+            seeds, best_iterations
+        ),
+    }
+
+
+def test_provenance_preserves_seed_ordered_best_iterations_outside_cache_key():
+    import v6_eval
+
+    index = pd.date_range("2023-01-01", periods=2, freq="h")
+    group = "kpx_group_1"
+    predictions = {group: pd.Series([3000.0, 4000.0], index=index, name=group)}
+    targets = {group: pd.Series([3100.0, 4100.0], index=index, name=group)}
+    common = {
+        "recipe": "synthetic",
+        "train_years": (2022,),
+        "valid_year": 2023,
+        "groups": (group,),
+        "seeds": (42, 202, 777),
+        "recipe_config": {"name": "synthetic", "version": 1},
+        "postprocess_config": {"floor_ratio": 0.1, "version": 1},
+        "feature_hash": "feature-sha",
+        "data_hashes": {"labels": "labels-sha"},
+        "row_counts": {"g1_train": 2, "g1_valid": 2},
+        "model_predictions": predictions,
+        "validation_targets": targets,
+    }
+
+    first = v6_eval.build_provenance(**common, best_iterations={group: (101, 102, 103)})
+    second = v6_eval.build_provenance(
+        **common, best_iterations={group: (201, 202, 203)}
+    )
+
+    assert first.best_iterations == {group: (101, 102, 103)}
+    assert first.best_iterations_hash != second.best_iterations_hash
+    assert first.manifest_key == second.manifest_key
+
+
+@pytest.mark.parametrize(
+    "best_iterations, message",
+    [
+        ({"kpx_group_1": (101, 102)}, "cardinality"),
+        ({"kpx_group_1": (101, True, 103)}, "positive integers"),
+        ({"kpx_group_1": (101, 102.0, 103)}, "positive integers"),
+        ({"pooled": (101, 102, 103)}, "family keys"),
+    ],
+)
+def test_provenance_rejects_invalid_best_iteration_evidence(best_iterations, message):
+    import v6_eval
+
+    index = pd.date_range("2023-01-01", periods=1, freq="h")
+    group = "kpx_group_1"
+    prediction = {group: pd.Series([3000.0], index=index, name=group)}
+    with pytest.raises(ProvenanceError, match=message):
+        v6_eval.build_provenance(
+            recipe="synthetic",
+            train_years=(2022,),
+            valid_year=2023,
+            groups=(group,),
+            seeds=(42, 202, 777),
+            recipe_config={"name": "synthetic", "version": 1},
+            postprocess_config={"floor_ratio": 0.1, "version": 1},
+            feature_hash="feature-sha",
+            data_hashes={"labels": "labels-sha"},
+            row_counts={"g1_train": 1, "g1_valid": 1},
+            model_predictions=prediction,
+            validation_targets=prediction,
+            best_iterations=best_iterations,
+        )
+
+
+def test_final_gate_artifact_round_trip_is_canonical_and_hash_bound(tmp_path):
+    import v6_eval
+
+    payload = _passing_final_gate_payload()
+    artifact_path = tmp_path / "final-gate.json"
+    json_path, sidecar_path = v6_eval.write_final_gate_artifact(
+        payload,
+        artifact_path,
+        expected_feature_hash=payload["hashes"]["features"],
+        expected_source_hashes=payload["hashes"]["sources"],
+    )
+
+    raw = json_path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    assert raw == (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert sidecar_path.read_text(encoding="ascii") == (f"{digest}  final-gate.json\n")
+    assert (
+        v6_eval.read_final_gate_artifact(
+            json_path,
+            expected_feature_hash=payload["hashes"]["features"],
+            expected_source_hashes=payload["hashes"]["sources"],
+        )
+        == payload
+    )
+
+
+def test_final_gate_reader_rejects_json_or_sidecar_tampering(tmp_path):
+    import v6_eval
+
+    payload = _passing_final_gate_payload()
+    artifact_path = tmp_path / "final-gate.json"
+    _, sidecar_path = v6_eval.write_final_gate_artifact(
+        payload,
+        artifact_path,
+        expected_feature_hash=payload["hashes"]["features"],
+        expected_source_hashes=payload["hashes"]["sources"],
+    )
+    original_json = artifact_path.read_bytes()
+    artifact_path.write_bytes(original_json.replace(b'"PASS"', b'"FAIL"'))
+    with pytest.raises(ProvenanceError, match="SHA-256"):
+        v6_eval.read_final_gate_artifact(
+            artifact_path,
+            expected_feature_hash=payload["hashes"]["features"],
+            expected_source_hashes=payload["hashes"]["sources"],
+        )
+
+    artifact_path.write_bytes(original_json)
+    sidecar_path.write_text(f"{'0' * 64}  final-gate.json\n", encoding="ascii")
+    with pytest.raises(ProvenanceError, match="SHA-256"):
+        v6_eval.read_final_gate_artifact(
+            artifact_path,
+            expected_feature_hash=payload["hashes"]["features"],
+            expected_source_hashes=payload["hashes"]["sources"],
+        )
+
+
+def test_final_gate_reader_recomputes_metrics_after_valid_digest_tampering(tmp_path):
+    import v6_eval
+
+    payload = _passing_final_gate_payload()
+    artifact_path = tmp_path / "final-gate.json"
+    _, sidecar_path = v6_eval.write_final_gate_artifact(
+        payload,
+        artifact_path,
+        expected_feature_hash=payload["hashes"]["features"],
+        expected_source_hashes=payload["hashes"]["sources"],
+    )
+    payload["folds"]["fold24"]["candidate"]["metrics"]["kpx_group_1"]["score"] += 0.01
+    raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+    artifact_path.write_bytes(raw)
+    sidecar_path.write_text(
+        f"{hashlib.sha256(raw).hexdigest()}  final-gate.json\n", encoding="ascii"
+    )
+
+    with pytest.raises(ProvenanceError, match="score does not match metrics"):
+        v6_eval.read_final_gate_artifact(
+            artifact_path,
+            expected_feature_hash=payload["hashes"]["features"],
+            expected_source_hashes=payload["hashes"]["sources"],
+        )
+
+
+def test_final_gate_default_reader_rehashes_current_raw_sources(monkeypatch, tmp_path):
+    import v6_eval
+
+    payload = _passing_final_gate_payload()
+    artifact_path = tmp_path / "final-gate.json"
+    v6_eval.write_final_gate_artifact(
+        payload,
+        artifact_path,
+        expected_feature_hash=payload["hashes"]["features"],
+        expected_source_hashes=payload["hashes"]["sources"],
+    )
+    stale_bundle = type(
+        "StaleBundle",
+        (),
+        {
+            "feature_hash": payload["hashes"]["features"],
+            "data_hashes": payload["hashes"]["sources"],
+        },
+    )()
+    monkeypatch.setattr(v6_eval, "load_bundle", lambda: stale_bundle)
+    monkeypatch.setattr(v6_eval, "_file_hash", lambda _path: "0" * 64)
+
+    with pytest.raises(ProvenanceError, match="source hashes"):
+        v6_eval.read_final_gate_artifact(artifact_path)
+
+
+def test_final_gate_writer_rejects_noncanonical_or_failed_payload_without_touching(
+    tmp_path,
+):
+    import v6_eval
+
+    artifact_path = tmp_path / "final-gate.json"
+    artifact_path.write_bytes(b"existing-promotion-evidence\n")
+    existing = artifact_path.read_bytes()
+    for mutate in (
+        lambda payload: payload.update(status="FAIL"),
+        lambda payload: payload.update(seeds=[42]),
+    ):
+        payload = _passing_final_gate_payload()
+        mutate(payload)
+        with pytest.raises(ProvenanceError):
+            v6_eval.write_final_gate_artifact(
+                payload,
+                artifact_path,
+                expected_feature_hash=payload["hashes"]["features"],
+                expected_source_hashes=payload["hashes"]["sources"],
+            )
+        assert artifact_path.read_bytes() == existing
+
+
+def test_default_stage7_runs_only_weighted_candidate_and_writes_canonical_gate(
+    monkeypatch, capsys, tmp_path
+):
+    import v6_eval
+
+    calls = []
+
+    class StubFold:
+        def __init__(self, recipe, valid_year, groups, seeds):
+            self.recipe = recipe
+            self.valid_year = valid_year
+            expected = (
+                v6_eval.EXPECTED_ROWS
+                if recipe == v6_eval.BASELINE_RECIPE
+                else v6_eval.WEIGHTED_EXPECTED_ROWS
+            )
+            families = {
+                group: tuple(100 + offset for offset, _ in enumerate(seeds))
+                for group in groups
+                if group in v6_eval.G12
+            }
+            if v6_eval.G3 in groups:
+                families["pooled"] = tuple(
+                    200 + offset for offset, _ in enumerate(seeds)
+                )
+            recipe_config = (
+                v6_eval.BASELINE_RECIPE_CONFIG
+                if recipe == v6_eval.BASELINE_RECIPE
+                else v6_eval.WEIGHTED_RECIPE_CONFIG
+            )
+            self.provenance = type(
+                "StubProvenance",
+                (),
+                {
+                    "row_counts": expected[v6_eval._fold_name(valid_year)],
+                    "manifest_key": ("b" if recipe == v6_eval.BASELINE_RECIPE else "c")
+                    * 64,
+                    "recipe_hash": v6_eval.recipe_fingerprint(recipe_config),
+                    "postprocess_hash": v6_eval.recipe_fingerprint(
+                        v6_eval.BASELINE_POSTPROCESS_CONFIG
+                    ),
+                    "feature_hash": "d" * 64,
+                    "data_hashes": {
+                        "gfs_train": "1" * 64,
+                        "ldaps_train": "2" * 64,
+                        "scada_unison": "3" * 64,
+                        "scada_vestas": "4" * 64,
+                        "train_labels": "5" * 64,
+                    },
+                    "best_iterations": families,
+                    "best_iterations_hash": _best_iterations_hash(seeds, families),
+                },
+            )()
+
+    def fit(recipe, train_years, valid_year, groups, seeds):
+        calls.append(recipe)
+        return StubFold(recipe, valid_year, groups, seeds)
+
+    scores = {
+        (v6_eval.BASELINE_RECIPE, 2023): 0.60,
+        (v6_eval.BASELINE_RECIPE, 2024): 0.60,
+        (v6_eval.WEIGHTED_RECIPE, 2023): 0.602,
+        (v6_eval.WEIGHTED_RECIPE, 2024): 0.601,
+    }
+
+    def metrics(fold):
+        groups = v6_eval.G12 if fold.valid_year == 2023 else tuple(v6_eval.GROUPS)
+        if fold.recipe == v6_eval.BASELINE_RECIPE:
+            nmae, ficr = 0.20, 0.40
+        elif fold.valid_year == 2023:
+            nmae, ficr = 0.198, 0.402
+        else:
+            nmae, ficr = 0.199, 0.401
+        return {
+            group: {
+                "nmae": nmae,
+                "ficr": ficr,
+                "score": 0.5 * (1.0 - nmae) + 0.5 * ficr,
+            }
+            for group in groups
+        }
+
+    artifact_path = tmp_path / "final-gate.json"
+    monkeypatch.setattr(v6_eval, "FINAL_GATE_PATH", artifact_path)
+    monkeypatch.setattr(v6_eval, "fit_fold", fit)
+    monkeypatch.setattr(
+        v6_eval, "score_fold", lambda fold: scores[(fold.recipe, fold.valid_year)]
+    )
+    monkeypatch.setattr(v6_eval, "assert_fold_alignment", lambda *_args: None)
+    monkeypatch.setattr(v6_eval, "fold_metrics", metrics)
+
+    assert v6_eval.run_stage7((42, 202, 777)) == 0
+    result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert calls == [
+        v6_eval.BASELINE_RECIPE,
+        v6_eval.BASELINE_RECIPE,
+        v6_eval.WEIGHTED_RECIPE,
+        v6_eval.WEIGHTED_RECIPE,
+    ]
+    assert result["candidate_recipe"] == v6_eval.WEIGHTED_RECIPE
+    assert result["status"] == "PASS"
+    assert artifact_path.is_file()
+    assert result == json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert set(result["fold24_candidate_best_iterations"]) == {
+        "kpx_group_1",
+        "kpx_group_2",
+        "pooled",
+    }
+
+
+def test_custom_stage7_diagnostic_never_overwrites_promotion_evidence(
+    monkeypatch, tmp_path
+):
+    import v6_eval
+
+    artifact_path = tmp_path / "final-gate.json"
+    artifact_path.write_bytes(b"existing-promotion-evidence\n")
+    monkeypatch.setattr(v6_eval, "FINAL_GATE_PATH", artifact_path)
+    monkeypatch.setattr(
+        v6_eval,
+        "fit_fold",
+        lambda *_args, **_kwargs: pytest.fail("diagnostic fixture stops before fit"),
+    )
+
+    assert v6_eval.run_stage7((42,), screen="unsupported") == 2
+    assert artifact_path.read_bytes() == b"existing-promotion-evidence\n"

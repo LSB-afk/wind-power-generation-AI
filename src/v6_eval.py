@@ -43,7 +43,11 @@ FLOOR_RATIO = 0.10
 G12 = ("kpx_group_1", "kpx_group_2")
 G3 = "kpx_group_3"
 EXPERIMENT_DIR = ROOT / ".omx" / "experiments" / "wind-v6"
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
+FINAL_GATE_SCHEMA_VERSION = 1
+FINAL_GATE_KIND = "wind-v6-final-gate"
+CANONICAL_SEEDS = (42, 202, 777)
+FINAL_GATE_PATH = EXPERIMENT_DIR / "final-gate.json"
 ANCHOR_TOLERANCE = 0.00015
 BASELINE_ANCHORS = {"fold23": 0.6316, "fold24": 0.6380}
 WEIGHTED_ANCHORS = {
@@ -192,6 +196,8 @@ class FoldProvenance:
     valid_year: int
     groups: tuple[str, ...]
     seeds: tuple[int, ...]
+    best_iterations: dict[str, tuple[int, ...]]
+    best_iterations_hash: str
     feature_hash: str
     data_hashes: dict[str, str]
     derived_data_hashes: dict[str, str]
@@ -236,6 +242,64 @@ def recipe_fingerprint(config: Mapping[str, object]) -> str:
     return _canonical_hash(_json_object(config, "recipe config"))
 
 
+def _expected_best_iteration_families(groups: tuple[str, ...]) -> tuple[str, ...]:
+    families = tuple(group for group in groups if group in G12)
+    if G3 in groups:
+        families += ("pooled",)
+    if len(families) != len(groups):
+        raise ProvenanceError("best iteration family keys do not match groups")
+    return families
+
+
+def _normalize_best_iterations(
+    best_iterations: Mapping[str, object],
+    *,
+    groups: tuple[str, ...],
+    seeds: tuple[int, ...],
+) -> dict[str, tuple[int, ...]]:
+    """Validate and preserve one positive iteration per seed and model family."""
+    if not isinstance(best_iterations, Mapping):
+        raise ProvenanceError("best iterations must be a mapping")
+    expected_families = _expected_best_iteration_families(groups)
+    if set(best_iterations) != set(expected_families):
+        raise ProvenanceError("best iteration family keys do not match groups")
+    normalized: dict[str, tuple[int, ...]] = {}
+    for family in expected_families:
+        values = best_iterations[family]
+        if not isinstance(values, (list, tuple)):
+            raise ProvenanceError(
+                f"{family} best iteration evidence must be an ordered sequence"
+            )
+        if len(values) != len(seeds):
+            raise ProvenanceError(
+                f"{family} best iteration cardinality does not match seeds"
+            )
+        if any(
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or int(value) <= 0
+            for value in values
+        ):
+            raise ProvenanceError(f"{family} best iterations must be positive integers")
+        normalized[family] = tuple(int(value) for value in values)
+    return normalized
+
+
+def best_iterations_fingerprint(
+    seeds: tuple[int, ...], best_iterations: Mapping[str, tuple[int, ...]]
+) -> str:
+    """Bind ordered seed evidence without making it part of the pre-fit cache key."""
+    return _canonical_hash(
+        {
+            "families": {
+                family: list(values)
+                for family, values in sorted(best_iterations.items())
+            },
+            "seeds": list(seeds),
+        }
+    )
+
+
 def _pandas_hash(obj: pd.DataFrame | pd.Series | pd.Index) -> str:
     digest = hashlib.sha256()
     if isinstance(obj, pd.Index):
@@ -260,6 +324,22 @@ def _file_hash(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _raw_source_paths() -> dict[str, Path]:
+    return {
+        "ldaps_train": TRAIN_DIR / "ldaps_train.csv",
+        "gfs_train": TRAIN_DIR / "gfs_train.csv",
+        "train_labels": TRAIN_DIR / "train_labels.csv",
+        "scada_vestas": TRAIN_DIR / "scada_vestas_train.csv",
+        "scada_unison": TRAIN_DIR / "scada_unison_train.csv",
+    }
+
+
+def _current_source_hashes() -> dict[str, str]:
+    return dict(
+        sorted((name, _file_hash(path)) for name, path in _raw_source_paths().items())
+    )
 
 
 def _assert_scada_source_hashes(
@@ -330,6 +410,7 @@ def build_provenance(
     feature_hash: str,
     data_hashes: Mapping[str, str],
     derived_data_hashes: Mapping[str, str] | None = None,
+    best_iterations: Mapping[str, object],
     row_counts: Mapping[str, int],
     model_predictions: Mapping[str, pd.Series],
     validation_targets: Mapping[str, pd.Series],
@@ -347,6 +428,9 @@ def build_provenance(
     data_hash_dict = dict(sorted(data_hashes.items()))
     derived_hash_dict = dict(sorted((derived_data_hashes or {}).items()))
     seed_tuple = tuple(int(seed) for seed in seeds)
+    normalized_best_iterations = _normalize_best_iterations(
+        best_iterations, groups=group_tuple, seeds=seed_tuple
+    )
     return FoldProvenance(
         recipe=recipe,
         recipe_config=normalized_recipe,
@@ -358,6 +442,10 @@ def build_provenance(
         valid_year=int(valid_year),
         groups=group_tuple,
         seeds=seed_tuple,
+        best_iterations=normalized_best_iterations,
+        best_iterations_hash=best_iterations_fingerprint(
+            seed_tuple, normalized_best_iterations
+        ),
         feature_hash=feature_hash,
         data_hashes=data_hash_dict,
         derived_data_hashes=derived_hash_dict,
@@ -409,6 +497,17 @@ def validate_fold_predictions(
         raise ProvenanceError("validation target group keys do not match provenance")
     if not provenance.seeds:
         raise ProvenanceError("fold has no seeds")
+    normalized_best_iterations = _normalize_best_iterations(
+        provenance.best_iterations,
+        groups=groups,
+        seeds=provenance.seeds,
+    )
+    if normalized_best_iterations != provenance.best_iterations:
+        raise ProvenanceError("best iteration evidence is not normalized")
+    if provenance.best_iterations_hash != best_iterations_fingerprint(
+        provenance.seeds, normalized_best_iterations
+    ):
+        raise ProvenanceError("best iteration fingerprint does not match")
     if provenance.cache_schema_version != CACHE_SCHEMA_VERSION:
         raise ProvenanceError("cache schema version does not match evaluator")
     if provenance.recipe_hash != recipe_fingerprint(provenance.recipe_config):
@@ -613,14 +712,7 @@ def load_bundle() -> TrainingBundle:
 
     potential, mismatch = load_scada_targets(labels)
     data = features.join(labels, how="inner")
-    source_paths = {
-        "ldaps_train": TRAIN_DIR / "ldaps_train.csv",
-        "gfs_train": TRAIN_DIR / "gfs_train.csv",
-        "train_labels": labels_path,
-        "scada_vestas": TRAIN_DIR / "scada_vestas_train.csv",
-        "scada_unison": TRAIN_DIR / "scada_unison_train.csv",
-    }
-    data_hashes = {name: _file_hash(path) for name, path in source_paths.items()}
+    data_hashes = _current_source_hashes()
     derived_data_hashes = {
         "potential_frame": _pandas_hash(potential),
         "mismatch_frame": _pandas_hash(mismatch),
@@ -690,8 +782,9 @@ def _fit_ensemble(
     seeds: tuple[int, ...],
     *,
     categorical: tuple[str, ...] = (),
-) -> np.ndarray:
+) -> tuple[np.ndarray, tuple[int, ...]]:
     predictions = []
+    best_iterations = []
     for seed in seeds:
         params = dict(BASELINE_PARAMS, seed=seed)
         train_set = lgb.Dataset(
@@ -712,7 +805,8 @@ def _fit_ensemble(
         predictions.append(
             model.predict(validation_features, num_iteration=model.best_iteration)
         )
-    return np.mean(predictions, axis=0)
+        best_iterations.append(int(model.best_iteration))
+    return np.mean(predictions, axis=0), tuple(best_iterations)
 
 
 def _fold_name(valid_year: int) -> str:
@@ -891,6 +985,8 @@ def _read_prediction_cache(
             "valid_year",
             "groups",
             "seeds",
+            "best_iterations",
+            "best_iterations_hash",
             "feature_hash",
             "data_hashes",
             "derived_data_hashes",
@@ -984,6 +1080,7 @@ def _read_prediction_cache(
             feature_hash=feature_fingerprint,
             data_hashes=data_hashes,
             derived_data_hashes=normalized_derived_hashes,
+            best_iterations=manifest["best_iterations"],
             row_counts=row_counts,
             model_predictions=model_predictions,
             validation_targets=validation_targets,
@@ -1109,6 +1206,7 @@ def fit_fold(
         return cached
 
     model_predictions: dict[str, pd.Series] = {}
+    best_iterations: dict[str, tuple[int, ...]] = {}
     columns = list(bundle.feature_columns)
     for group in groups:
         capacity = CAPACITY_KWH[group]
@@ -1116,29 +1214,29 @@ def fit_fold(
         validation_target = validation_targets[group]
         if group in G12:
             train = solo_frames[group]
-            raw_prediction = _fit_ensemble(
+            raw_prediction, family_best_iterations = _fit_ensemble(
                 train[columns],
                 train["_target"],
                 validation[columns],
                 validation_target,
                 seeds,
             )
+            best_iterations[group] = family_best_iterations
         else:
             if pooled_frame is None:
                 raise ProvenanceError("pooled training frame is missing")
             validation_features = validation[columns].copy()
             validation_features["group_id"] = 3
-            raw_prediction = (
-                _fit_ensemble(
-                    pooled_frame[list(pooled_columns)],
-                    pooled_frame["normalized_target"],
-                    validation_features[list(pooled_columns)],
-                    validation_target / capacity,
-                    seeds,
-                    categorical=("group_id",),
-                )
-                * capacity
+            normalized_prediction, family_best_iterations = _fit_ensemble(
+                pooled_frame[list(pooled_columns)],
+                pooled_frame["normalized_target"],
+                validation_features[list(pooled_columns)],
+                validation_target / capacity,
+                seeds,
+                categorical=("group_id",),
             )
+            raw_prediction = normalized_prediction * capacity
+            best_iterations["pooled"] = family_best_iterations
         clipped = np.clip(raw_prediction, 0.0, capacity)
         model_predictions[group] = pd.Series(
             apply_floor10(clipped, capacity), index=validation.index, name=group
@@ -1155,6 +1253,7 @@ def fit_fold(
         feature_hash=bundle.feature_hash,
         data_hashes=bundle.data_hashes,
         derived_data_hashes=derived_data_hashes,
+        best_iterations=best_iterations,
         row_counts=row_counts,
         model_predictions=model_predictions,
         validation_targets=validation_targets,
@@ -1232,6 +1331,334 @@ def fold_metrics(predictions: FoldPredictions) -> dict[str, dict[str, float]]:
     return metrics
 
 
+def _canonical_json_bytes(value: object) -> bytes:
+    try:
+        return (
+            json.dumps(
+                value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ProvenanceError("final gate must be canonical JSON") from error
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _finite_number(value: object, field_name: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ProvenanceError(f"{field_name} must be a finite number")
+    number = float(value)
+    if not np.isfinite(number):
+        raise ProvenanceError(f"{field_name} must be a finite number")
+    return number
+
+
+def _validate_final_gate_payload(
+    payload: Mapping[str, object],
+    *,
+    expected_feature_hash: str,
+    expected_source_hashes: Mapping[str, str],
+) -> dict[str, object]:
+    """Strictly validate promotion evidence and recompute its score contract."""
+    expected_fields = {
+        "kind",
+        "schema_version",
+        "cache_schema_version",
+        "status",
+        "seeds",
+        "candidate_recipe",
+        "recipes",
+        "hashes",
+        "folds",
+        "mean_delta",
+        "fold24_candidate_best_iterations",
+        "fold24_candidate_best_iterations_hash",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != expected_fields:
+        raise ProvenanceError("final gate fields do not match schema")
+    if payload["kind"] != FINAL_GATE_KIND:
+        raise ProvenanceError("final gate kind does not match")
+    if payload["schema_version"] != FINAL_GATE_SCHEMA_VERSION:
+        raise ProvenanceError("final gate schema version does not match")
+    if payload["cache_schema_version"] != CACHE_SCHEMA_VERSION:
+        raise ProvenanceError("final gate cache schema version does not match")
+    if payload["status"] != "PASS":
+        raise ProvenanceError("final gate status is not PASS")
+    if payload["seeds"] != list(CANONICAL_SEEDS):
+        raise ProvenanceError("final gate seeds are not canonical")
+    recipes = payload["recipes"]
+    expected_recipes = {
+        "baseline": BASELINE_RECIPE,
+        "candidate": WEIGHTED_RECIPE,
+    }
+    if recipes != expected_recipes or payload["candidate_recipe"] != WEIGHTED_RECIPE:
+        raise ProvenanceError("final gate recipes do not match")
+    hashes = payload["hashes"]
+    if not isinstance(hashes, Mapping) or set(hashes) != {
+        "recipes",
+        "postprocess",
+        "features",
+        "sources",
+    }:
+        raise ProvenanceError("final gate hashes do not match schema")
+    expected_recipe_hashes = {
+        "baseline": recipe_fingerprint(BASELINE_RECIPE_CONFIG),
+        "candidate": recipe_fingerprint(WEIGHTED_RECIPE_CONFIG),
+    }
+    if hashes["recipes"] != expected_recipe_hashes:
+        raise ProvenanceError("final gate recipe hashes do not match")
+    if hashes["postprocess"] != recipe_fingerprint(BASELINE_POSTPROCESS_CONFIG):
+        raise ProvenanceError("final gate postprocess hash does not match")
+    if hashes["features"] != expected_feature_hash or not _is_sha256(
+        hashes["features"]
+    ):
+        raise ProvenanceError("final gate feature hash does not match")
+    normalized_sources = dict(sorted(expected_source_hashes.items()))
+    if hashes["sources"] != normalized_sources or not all(
+        _is_sha256(value) for value in normalized_sources.values()
+    ):
+        raise ProvenanceError("final gate source hashes do not match")
+
+    folds = payload["folds"]
+    if not isinstance(folds, Mapping) or set(folds) != {"fold23", "fold24"}:
+        raise ProvenanceError("final gate folds do not match")
+    baseline_scores: dict[str, float] = {}
+    candidate_scores: dict[str, float] = {}
+    for fold_name, expected_groups in (
+        ("fold23", G12),
+        ("fold24", tuple(GROUPS)),
+    ):
+        fold = folds[fold_name]
+        if not isinstance(fold, Mapping) or set(fold) != {
+            "baseline",
+            "candidate",
+            "delta",
+        }:
+            raise ProvenanceError(f"{fold_name} fields do not match schema")
+        for lane, destination in (
+            ("baseline", baseline_scores),
+            ("candidate", candidate_scores),
+        ):
+            evidence = fold[lane]
+            if not isinstance(evidence, Mapping) or set(evidence) != {
+                "score",
+                "metrics",
+                "manifest_key",
+            }:
+                raise ProvenanceError(f"{fold_name} {lane} fields do not match schema")
+            if not _is_sha256(evidence["manifest_key"]):
+                raise ProvenanceError(f"{fold_name} {lane} manifest key is invalid")
+            metrics = evidence["metrics"]
+            if not isinstance(metrics, Mapping) or set(metrics) != set(expected_groups):
+                raise ProvenanceError(f"{fold_name} {lane} metric groups do not match")
+            group_scores = []
+            for group in expected_groups:
+                values = metrics[group]
+                if not isinstance(values, Mapping) or set(values) != {
+                    "nmae",
+                    "ficr",
+                    "score",
+                }:
+                    raise ProvenanceError(
+                        f"{fold_name} {lane} {group} metrics do not match schema"
+                    )
+                nmae = _finite_number(values["nmae"], f"{group} nmae")
+                ficr = _finite_number(values["ficr"], f"{group} ficr")
+                declared_group_score = _finite_number(values["score"], f"{group} score")
+                computed_group_score = 0.5 * (1.0 - nmae) + 0.5 * ficr
+                if not np.isclose(
+                    declared_group_score, computed_group_score, rtol=0.0, atol=1e-12
+                ):
+                    raise ProvenanceError(f"{group} score does not match metrics")
+                group_scores.append(computed_group_score)
+            computed_score = float(np.mean(group_scores))
+            declared_score = _finite_number(
+                evidence["score"], f"{fold_name} {lane} score"
+            )
+            if not np.isclose(declared_score, computed_score, rtol=0.0, atol=1e-12):
+                raise ProvenanceError(f"{fold_name} {lane} score does not match")
+            destination[fold_name] = declared_score
+        computed_delta = candidate_scores[fold_name] - baseline_scores[fold_name]
+        declared_delta = _finite_number(fold["delta"], f"{fold_name} delta")
+        if not np.isclose(declared_delta, computed_delta, rtol=0.0, atol=1e-12):
+            raise ProvenanceError(f"{fold_name} delta does not match")
+
+    gate = gate_scores(baseline_scores, candidate_scores)
+    if gate["status"] != "PASS" or not np.isclose(
+        _finite_number(payload["mean_delta"], "mean delta"),
+        gate["mean_delta"],
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ProvenanceError("final gate result does not pass score contract")
+    best_iteration_payload = payload["fold24_candidate_best_iterations"]
+    if not isinstance(best_iteration_payload, Mapping):
+        raise ProvenanceError("final gate best iterations must be a mapping")
+    normalized_best_iterations = _normalize_best_iterations(
+        best_iteration_payload,
+        groups=tuple(GROUPS),
+        seeds=CANONICAL_SEEDS,
+    )
+    serialized_best_iterations = {
+        family: list(values) for family, values in normalized_best_iterations.items()
+    }
+    if payload["fold24_candidate_best_iterations"] != serialized_best_iterations:
+        raise ProvenanceError("final gate best iterations are not normalized")
+    expected_best_iterations_hash = best_iterations_fingerprint(
+        CANONICAL_SEEDS, normalized_best_iterations
+    )
+    if (
+        payload["fold24_candidate_best_iterations_hash"]
+        != expected_best_iterations_hash
+    ):
+        raise ProvenanceError("final gate best iteration fingerprint does not match")
+    return json.loads(_canonical_json_bytes(payload))
+
+
+def read_final_gate_artifact(
+    path: Path = FINAL_GATE_PATH,
+    *,
+    expected_feature_hash: str | None = None,
+    expected_source_hashes: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Read hash-bound canonical PASS evidence and compare it with current inputs."""
+    path = Path(path)
+    sidecar_path = path.with_name(f"{path.name}.sha256")
+    try:
+        raw = path.read_bytes()
+        sidecar = sidecar_path.read_text(encoding="ascii")
+    except OSError as error:
+        raise ProvenanceError(f"final gate artifact is incomplete: {error}") from error
+    digest = hashlib.sha256(raw).hexdigest()
+    if sidecar != f"{digest}  {path.name}\n":
+        raise ProvenanceError("final gate SHA-256 sidecar does not match")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProvenanceError("final gate JSON is malformed") from error
+    if raw != _canonical_json_bytes(payload):
+        raise ProvenanceError("final gate JSON bytes are not canonical")
+    if expected_feature_hash is None or expected_source_hashes is None:
+        bundle = load_bundle()
+        if expected_feature_hash is None:
+            expected_feature_hash = bundle.feature_hash
+        if expected_source_hashes is None:
+            expected_source_hashes = _current_source_hashes()
+    return _validate_final_gate_payload(
+        payload,
+        expected_feature_hash=expected_feature_hash,
+        expected_source_hashes=expected_source_hashes,
+    )
+
+
+def write_final_gate_artifact(
+    payload: Mapping[str, object],
+    path: Path = FINAL_GATE_PATH,
+    *,
+    expected_feature_hash: str,
+    expected_source_hashes: Mapping[str, str],
+) -> tuple[Path, Path]:
+    """Atomically publish exact-seed PASS evidence and its byte digest."""
+    normalized = _validate_final_gate_payload(
+        payload,
+        expected_feature_hash=expected_feature_hash,
+        expected_source_hashes=expected_source_hashes,
+    )
+    raw = _canonical_json_bytes(normalized)
+    path = Path(path)
+    sidecar_path = path.with_name(f"{path.name}.sha256")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_json = path.with_name(f".{path.name}.tmp")
+    temporary_sidecar = sidecar_path.with_name(f".{sidecar_path.name}.tmp")
+    digest = hashlib.sha256(raw).hexdigest()
+    temporary_json.write_bytes(raw)
+    temporary_sidecar.write_text(f"{digest}  {path.name}\n", encoding="ascii")
+    temporary_json.replace(path)
+    temporary_sidecar.replace(sidecar_path)
+    read_final_gate_artifact(
+        path,
+        expected_feature_hash=expected_feature_hash,
+        expected_source_hashes=expected_source_hashes,
+    )
+    return path, sidecar_path
+
+
+def _build_final_gate_payload(
+    *,
+    baseline_folds: Mapping[str, FoldPredictions],
+    candidate_folds: Mapping[str, FoldPredictions],
+    baseline_scores: Mapping[str, float],
+    candidate_scores: Mapping[str, float],
+) -> dict[str, object]:
+    gate = gate_scores(dict(baseline_scores), dict(candidate_scores))
+    if gate["status"] != "PASS":
+        raise ProvenanceError("failed gate cannot become promotion evidence")
+    fold24_provenance = candidate_folds["fold24"].provenance
+    payload: dict[str, object] = {
+        "kind": FINAL_GATE_KIND,
+        "schema_version": FINAL_GATE_SCHEMA_VERSION,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "status": "PASS",
+        "seeds": list(CANONICAL_SEEDS),
+        "candidate_recipe": WEIGHTED_RECIPE,
+        "recipes": {
+            "baseline": BASELINE_RECIPE,
+            "candidate": WEIGHTED_RECIPE,
+        },
+        "hashes": {
+            "recipes": {
+                "baseline": recipe_fingerprint(BASELINE_RECIPE_CONFIG),
+                "candidate": recipe_fingerprint(WEIGHTED_RECIPE_CONFIG),
+            },
+            "postprocess": recipe_fingerprint(BASELINE_POSTPROCESS_CONFIG),
+            "features": fold24_provenance.feature_hash,
+            "sources": dict(sorted(fold24_provenance.data_hashes.items())),
+        },
+        "folds": {
+            fold_name: {
+                "baseline": {
+                    "score": baseline_scores[fold_name],
+                    "metrics": fold_metrics(baseline_folds[fold_name]),
+                    "manifest_key": baseline_folds[fold_name].provenance.manifest_key,
+                },
+                "candidate": {
+                    "score": candidate_scores[fold_name],
+                    "metrics": fold_metrics(candidate_folds[fold_name]),
+                    "manifest_key": candidate_folds[fold_name].provenance.manifest_key,
+                },
+                "delta": gate["deltas"][fold_name],
+            }
+            for fold_name in ("fold23", "fold24")
+        },
+        "mean_delta": gate["mean_delta"],
+        "fold24_candidate_best_iterations": {
+            family: list(values)
+            for family, values in fold24_provenance.best_iterations.items()
+        },
+        "fold24_candidate_best_iterations_hash": (
+            fold24_provenance.best_iterations_hash
+        ),
+    }
+    return _validate_final_gate_payload(
+        payload,
+        expected_feature_hash=fold24_provenance.feature_hash,
+        expected_source_hashes=fold24_provenance.data_hashes,
+    )
+
+
 def run_stage7(
     seeds: tuple[int, ...], baseline_only: bool = False, screen: str | None = None
 ) -> int:
@@ -1241,11 +1668,7 @@ def run_stage7(
         print("--baseline-only cannot be combined with --screen", file=sys.stderr)
         return 2
     if not baseline_only and screen is None:
-        print(
-            "stage7 requires --baseline-only or --screen weighted",
-            file=sys.stderr,
-        )
-        return 2
+        screen = "weighted"
     if screen not in {None, "weighted"}:
         print(f"unsupported stage7 screen: {screen}", file=sys.stderr)
         return 2
@@ -1288,7 +1711,7 @@ def run_stage7(
             assert_weighted_score_anchor(fold_name, score, seeds=seeds)
             print(f"[{fold_name}] weighted v6 score={score:.6f}")
         gate = gate_scores(scores, candidates)
-        result = {
+        result: dict[str, object] = {
             **gate,
             "candidate_recipe": WEIGHTED_RECIPE,
             "seeds": list(seeds),
@@ -1312,7 +1735,45 @@ def run_stage7(
                     "fold24": candidate24.provenance.manifest_key,
                 },
             },
+            "best_iterations": {
+                "baseline": {
+                    "fold23": {
+                        family: list(values)
+                        for family, values in fold23.provenance.best_iterations.items()
+                    },
+                    "fold24": {
+                        family: list(values)
+                        for family, values in fold24.provenance.best_iterations.items()
+                    },
+                },
+                "candidate": {
+                    "fold23": {
+                        family: list(values)
+                        for family, values in candidate23.provenance.best_iterations.items()
+                    },
+                    "fold24": {
+                        family: list(values)
+                        for family, values in candidate24.provenance.best_iterations.items()
+                    },
+                },
+            },
         }
+        if seeds == CANONICAL_SEEDS and gate["status"] == "PASS":
+            result = _build_final_gate_payload(
+                baseline_folds={"fold23": fold23, "fold24": fold24},
+                candidate_folds={
+                    "fold23": candidate23,
+                    "fold24": candidate24,
+                },
+                baseline_scores=scores,
+                candidate_scores=candidates,
+            )
+            write_final_gate_artifact(
+                result,
+                FINAL_GATE_PATH,
+                expected_feature_hash=candidate24.provenance.feature_hash,
+                expected_source_hashes=candidate24.provenance.data_hashes,
+            )
         print(json.dumps(result, sort_keys=True))
         return 0 if gate["status"] == "PASS" else 1
     except (
