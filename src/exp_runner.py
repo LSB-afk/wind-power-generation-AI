@@ -17,6 +17,7 @@ from config import CAPACITY_KWH, GROUPS, RANDOM_SEED, ROOT, TRAIN_DIR
 from features import build_features, _wind_speed
 from geo import idw_weights
 from metrics import competition_score, group_ficr, group_nmae
+from v6_eval import run_stage7
 
 CACHE = ROOT / "cache"
 
@@ -696,9 +697,14 @@ def main():
         stage4(data, cols)
     elif mode == "stage5":
         stage5({"base": dataset(base_feat), "ctx": dataset(feat_ctx)})
-    else:
+    elif mode == "stage6":
         stage6({"ctx": dataset(feat_ctx)})
+    elif mode == "stage7":
+        return run_stage7(SEEDS3)
+    else:
+        print(f"unknown mode: {mode}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
