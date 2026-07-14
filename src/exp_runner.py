@@ -17,7 +17,6 @@ from config import CAPACITY_KWH, GROUPS, RANDOM_SEED, ROOT, TRAIN_DIR
 from features import build_features, _wind_speed
 from geo import idw_weights
 from metrics import competition_score, group_ficr, group_nmae
-from v6_eval import run_stage7
 
 CACHE = ROOT / "cache"
 
@@ -671,65 +670,17 @@ def stage4(data, cols):
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "stage3"
-    if mode == "stage7":
-        seeds = SEEDS3
-        baseline_only = False
-        screen = None
-        args = sys.argv[2:]
-        position = 0
-        while position < len(args):
-            argument = args[position]
-            if argument == "--baseline-only":
-                baseline_only = True
-                position += 1
-                continue
-            if argument == "--seeds":
-                position += 1
-                seed_values = []
-                while position < len(args) and not args[position].startswith("--"):
-                    seed_values.append(args[position])
-                    position += 1
-                if not seed_values:
-                    print("--seeds requires at least one integer", file=sys.stderr)
-                    return 2
-                try:
-                    seeds = tuple(int(value) for value in seed_values)
-                except ValueError:
-                    print(
-                        f"invalid --seeds value: {' '.join(seed_values)}",
-                        file=sys.stderr,
-                    )
-                    return 2
-                continue
-            if argument == "--screen":
-                position += 1
-                if position >= len(args) or args[position].startswith("--"):
-                    print("--screen requires one value", file=sys.stderr)
-                    return 2
-                screen = args[position]
-                position += 1
-                continue
-            print(f"unknown stage7 argument: {argument}", file=sys.stderr)
-            return 2
-        if screen is None:
-            return run_stage7(seeds, baseline_only=baseline_only)
-        return run_stage7(seeds, baseline_only=baseline_only, screen=screen)
-    if mode not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6"}:
-        print(f"unknown mode: {mode}", file=sys.stderr)
-        return 2
-
     build_cache()
     base_feat, ldaps_raw, gfs_raw, labels = load_cache()
     davail = ldaps_raw.drop_duplicates("forecast_kst_dtm").set_index(
-        "forecast_kst_dtm"
-    )["data_available_kst_dtm"]
+        "forecast_kst_dtm")["data_available_kst_dtm"]
 
     feat_ctx = add_context(base_feat, davail)
 
     def dataset(feat):
         return feat.join(labels, how="inner"), list(feat.columns)
 
+    mode = sys.argv[1] if len(sys.argv) > 1 else "stage3"
     if mode == "stage1":
         feat_full = add_idw(feat_ctx, ldaps_raw, gfs_raw)
         stage1({"E0_base": dataset(base_feat), "E1_ctx": dataset(feat_ctx),
@@ -745,9 +696,9 @@ def main():
         stage4(data, cols)
     elif mode == "stage5":
         stage5({"base": dataset(base_feat), "ctx": dataset(feat_ctx)})
-    elif mode == "stage6":
+    else:
         stage6({"ctx": dataset(feat_ctx)})
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

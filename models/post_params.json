@@ -1,1 +1,14 @@
-{"config":{"clip_max_ratio":1.0,"clip_min_ratio":0.0,"floor_ratio":0.1,"kind":"capacity_clip_then_floor","version":1},"config_sha256":"698cb8dfd72cd3c1748c56822021c33a7fdc3847b2463b3693ed91cf642e369d","groups":{"kpx_group_1":{"floor_kwh":2160.0,"floor_ratio":0.1,"scale":1.0},"kpx_group_2":{"floor_kwh":2160.0,"floor_ratio":0.1,"scale":1.0},"kpx_group_3":{"floor_kwh":2100.0,"floor_ratio":0.1,"scale":1.0}}}
+{
+  "kpx_group_1": {
+    "scale": 1.0,
+    "floor": 2160.0
+  },
+  "kpx_group_2": {
+    "scale": 1.0,
+    "floor": 2160.0
+  },
+  "kpx_group_3": {
+    "scale": 1.0,
+    "floor": 2100.0
+  }
+}
