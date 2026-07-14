@@ -1682,7 +1682,7 @@ def run_stage7(
             assert_score_anchor(fold_name, score, seeds=seeds)
             print(f"[{fold_name}] frozen v5 C1 score={score:.6f}")
         if baseline_only:
-            result = {
+            baseline_result = {
                 "status": "BASELINE_OK",
                 "recipe": BASELINE_RECIPE,
                 "seeds": list(seeds),
@@ -1692,7 +1692,7 @@ def run_stage7(
                     "fold24": fold24.provenance.manifest_key,
                 },
             }
-            print(json.dumps(result, sort_keys=True))
+            print(json.dumps(baseline_result, sort_keys=True))
             return 0
 
         candidate23 = fit_fold(WEIGHTED_RECIPE, (2022,), 2023, G12, seeds)

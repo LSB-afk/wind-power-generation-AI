@@ -14,20 +14,23 @@ import json
 import os
 from pathlib import Path
 import platform
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, cast
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
 from config import CAPACITY_KWH, GROUPS, MODEL_DIR, TEST_DIR
-from scada import build_weighted_targets
+from scada import WeightCalibration, build_weighted_targets
 from v6_eval import (
     BASELINE_PARAMS,
     BASELINE_POSTPROCESS_CONFIG,
     CANONICAL_SEEDS,
     FINAL_GATE_PATH,
+    FoldPredictions,
     G12,
+    TRAIN_FILTER_RATIO,
+    TrainingBundle,
     WEIGHTED_RECIPE,
     WEIGHTED_RECIPE_CONFIG,
     _assert_scada_source_hashes,
@@ -176,18 +179,20 @@ def _source_hashes() -> dict[str, dict[str, str]]:
     }
 
 
-def _calibration_record(calibration: object) -> dict[str, object]:
-    record = asdict(calibration)  # type: ignore[arg-type]
+def _calibration_record(calibration: WeightCalibration) -> dict[str, object]:
+    record = asdict(calibration)
     record["train_label_years"] = list(record["train_label_years"])
     record["turbine_columns"] = list(record["turbine_columns"])
     record["weights"] = list(record["weights"])
     return record
 
 
-def _validate_gate_and_fold24(bundle: object) -> tuple[dict[str, object], object]:
+def _validate_gate_and_fold24(
+    bundle: TrainingBundle,
+) -> tuple[dict[str, object], FoldPredictions]:
     gate = read_final_gate_artifact(
-        expected_feature_hash=bundle.feature_hash,  # type: ignore[attr-defined]
-        expected_source_hashes=bundle.data_hashes,  # type: ignore[attr-defined]
+        expected_feature_hash=bundle.feature_hash,
+        expected_source_hashes=bundle.data_hashes,
     )
     fold24 = fit_fold(
         WEIGHTED_RECIPE,
@@ -196,7 +201,8 @@ def _validate_gate_and_fold24(bundle: object) -> tuple[dict[str, object], object
         tuple(GROUPS),
         CANONICAL_SEEDS,
     )
-    evidence = gate["folds"]["fold24"]["candidate"]
+    gate_folds = cast(Mapping[str, Mapping[str, Mapping[str, object]]], gate["folds"])
+    evidence = gate_folds["fold24"]["candidate"]
     if fold24.provenance.manifest_key != evidence["manifest_key"]:
         raise TrainingContractError("candidate fold24 manifest parity failed")
     declared_iterations = gate["fold24_candidate_best_iterations"]
@@ -212,6 +218,7 @@ def _validate_gate_and_fold24(bundle: object) -> tuple[dict[str, object], object
 def main() -> None:
     bundle = load_bundle()
     gate, fold24 = _validate_gate_and_fold24(bundle)
+    gate_folds = cast(Mapping[str, Mapping[str, Mapping[str, object]]], gate["folds"])
 
     weighted_targets, calibrations = build_weighted_targets(
         bundle.labels.index,
@@ -248,7 +255,7 @@ def main() -> None:
             f"full training row fingerprint drift: {actual_rows}"
         )
 
-    iterations = gate["fold24_candidate_best_iterations"]
+    iterations = cast(Mapping[str, list[int]], gate["fold24_candidate_best_iterations"])
     family_frames = {
         "kpx_group_1": (
             solo_frames["kpx_group_1"][list(bundle.feature_columns)],
@@ -299,15 +306,15 @@ def main() -> None:
         )
 
     feature_raw = "\n".join(bundle.feature_columns).encode("utf-8")
+    floor_ratio = cast(float, BASELINE_POSTPROCESS_CONFIG["floor_ratio"])
     post_payload = {
         "config": BASELINE_POSTPROCESS_CONFIG,
         "config_sha256": recipe_fingerprint(BASELINE_POSTPROCESS_CONFIG),
         "groups": {
             group: {
                 "scale": 1.0,
-                "floor_ratio": BASELINE_POSTPROCESS_CONFIG["floor_ratio"],
-                "floor_kwh": BASELINE_POSTPROCESS_CONFIG["floor_ratio"]
-                * CAPACITY_KWH[group],
+                "floor_ratio": floor_ratio,
+                "floor_kwh": floor_ratio * CAPACITY_KWH[group],
             }
             for group in GROUPS
         },
@@ -338,9 +345,9 @@ def main() -> None:
             "artifact_sha256": sha256_file(FINAL_GATE_PATH),
             "seeds": gate["seeds"],
             "mean_delta": gate["mean_delta"],
-            "folds": gate["folds"],
+            "folds": gate_folds,
             "candidate_manifests": {
-                name: gate["folds"][name]["candidate"]["manifest_key"]
+                name: gate_folds[name]["candidate"]["manifest_key"]
                 for name in ("fold23", "fold24")
             },
             "fold24_best_iterations_sha256": gate[
@@ -368,7 +375,7 @@ def main() -> None:
         "training": {
             "params": BASELINE_PARAMS,
             "seeds": list(CANONICAL_SEEDS),
-            "filter_ratio": WEIGHTED_RECIPE_CONFIG["training"]["filter_ratio"],
+            "filter_ratio": TRAIN_FILTER_RATIO,
             "mismatch_frame_sha256": bundle.derived_data_hashes["mismatch_frame"],
             "fold24_manifest_key": fold24.provenance.manifest_key,
             "families": training_families,

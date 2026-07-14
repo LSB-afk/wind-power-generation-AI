@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 import lightgbm as lgb
 import numpy as np
@@ -126,15 +126,13 @@ def validate_model_relative_path(value: object) -> str:
     return value
 
 
-def _require_keys(
-    value: object, expected: set[str], field: str
-) -> Mapping[str, object]:
+def _require_keys(value: object, expected: set[str], field: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != expected:
         raise InferenceContractError(f"{field} fields do not match schema")
     return value
 
 
-def _validate_recipe(recipe: object) -> dict[str, object]:
+def _validate_recipe(recipe: object) -> dict[str, Any]:
     root = _require_keys(recipe, ROOT_RECIPE_KEYS, "recipe")
     if root["kind"] != RECIPE_KIND or root["schema_version"] != RECIPE_SCHEMA_VERSION:
         raise InferenceContractError("recipe identity does not match")
@@ -318,7 +316,7 @@ def _validate_recipe(recipe: object) -> dict[str, object]:
     return dict(root)
 
 
-def _load_verified_recipe() -> dict[str, object]:
+def _load_verified_recipe() -> dict[str, Any]:
     recipe_path = MODEL_DIR / "recipe.json"
     sidecar_path = MODEL_DIR / "recipe.json.sha256"
     try:
@@ -392,7 +390,7 @@ def validate_submission_frame(
 
 
 def _load_models(
-    recipe: Mapping[str, object], feature_columns: list[str]
+    recipe: Mapping[str, Any], feature_columns: list[str]
 ) -> dict[str, list[lgb.Booster]]:
     families = recipe["training"]["families"]
     loaded: dict[str, list[lgb.Booster]] = {}
