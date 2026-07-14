@@ -18,6 +18,7 @@ from v6_eval import (
     WEIGHTED_RECIPE_CONFIG,
     FoldPredictions,
     ProvenanceError,
+    TrainingBundle,
     apply_floor10,
     assert_baseline_fingerprint,
     assert_weighted_fingerprint,
@@ -618,6 +619,60 @@ def test_load_bundle_rebuilds_every_derived_frame_from_raw(monkeypatch):
     pd.testing.assert_frame_equal(bundle.potential, potential)
     pd.testing.assert_frame_equal(bundle.mismatch, mismatch)
     assert [call[0] for call in calls] == ["features", "potential", "mismatch"]
+
+
+def test_weighted_candidate_rechecks_scada_hashes_after_target_reconstruction(
+    monkeypatch,
+):
+    import v6_eval
+
+    index = pd.DatetimeIndex(["2022-01-01 01:00", "2023-01-01 01:00"])
+    labels = pd.DataFrame(
+        {group: [3000.0, 4000.0] for group in v6_eval.G12}, index=index
+    )
+    data = labels.copy()
+    potential = pd.DataFrame(
+        {f"{group}_potential": [3000.0, 4000.0] for group in v6_eval.G12},
+        index=index,
+    )
+    mismatch = pd.DataFrame(
+        {f"{group}_mismatch": [False, False] for group in v6_eval.G12},
+        index=index,
+    )
+    weighted = pd.DataFrame(
+        {f"{group}_weighted_potential": [3000.0, np.nan] for group in v6_eval.G12},
+        index=index,
+    )
+    bundle = TrainingBundle(
+        features=pd.DataFrame(index=index),
+        labels=labels,
+        potential=potential,
+        mismatch=mismatch,
+        data=data,
+        feature_columns=(),
+        feature_hash="feature-sha",
+        data_hashes={
+            "scada_vestas": "before-vestas-sha",
+            "scada_unison": "before-unison-sha",
+        },
+        derived_data_hashes={"mismatch_frame": "mismatch-sha"},
+    )
+    monkeypatch.setattr(v6_eval, "load_bundle", lambda: bundle)
+    monkeypatch.setattr(
+        v6_eval,
+        "build_weighted_targets",
+        lambda *_args, **_kwargs: (weighted, {}),
+    )
+    monkeypatch.setattr(v6_eval, "_file_hash", lambda _path: "changed-scada-sha")
+
+    with pytest.raises(ProvenanceError, match="SCADA source hash changed"):
+        v6_eval.fit_fold(
+            v6_eval.WEIGHTED_RECIPE,
+            (2022,),
+            2023,
+            v6_eval.G12,
+            (42,),
+        )
 
 
 def test_baseline_guards_reject_row_or_anchor_drift():

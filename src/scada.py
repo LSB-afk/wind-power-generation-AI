@@ -189,11 +189,14 @@ def build_weighted_targets(
     unknown = set(selected_groups) - set(_GROUP_TURBINES)
     if unknown:
         raise ValueError(f"unknown groups: {sorted(unknown)}")
+    training_years = tuple(sorted({int(year) for year in train_label_years}))
     years = (
-        tuple(train_label_years)
+        training_years
         if target_label_years is None
-        else tuple(target_label_years)
+        else tuple(sorted({int(year) for year in target_label_years}))
     )
+    if not set(years).issubset(training_years):
+        raise ValueError("target label-years must be a subset of training label-years")
     frames = _load_scada() if scada_frames is None else dict(scada_frames)
     targets: dict[str, pd.Series] = {}
     calibrations: dict[str, WeightCalibration] = {}
@@ -207,7 +210,7 @@ def build_weighted_targets(
             maker=maker,
             turbines=turbines,
             capacity_kwh=CAPACITY_KWH[group],
-            train_label_years=train_label_years,
+            train_label_years=training_years,
         )
         potential_10m = reconstruct_weighted_potential(
             scada,

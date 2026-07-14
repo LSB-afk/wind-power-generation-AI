@@ -289,6 +289,27 @@ def test_build_weighted_targets_accepts_only_indexes_and_masks_other_label_years
     assert calibrations["kpx_group_1"].group == "kpx_group_1"
 
 
+def test_build_weighted_targets_rejects_held_out_target_label_year():
+    index = pd.DatetimeIndex(["2022-01-01 01:00", "2023-01-01 01:00"])
+    frame = _scada_frame(
+        index,
+        powers=[[100.0] * 6, [120.0] * 6],
+        winds=[[6.0] * 6] * 2,
+        maker="vestas",
+    )
+
+    with pytest.raises(
+        ValueError, match="target label-years must be a subset of training label-years"
+    ):
+        build_weighted_targets(
+            index,
+            train_label_years=(2022,),
+            target_label_years=(2023,),
+            groups=("kpx_group_1",),
+            scada_frames={"vestas": frame},
+        )
+
+
 def test_build_weighted_targets_never_calibrates_unrequested_group3():
     index = pd.DatetimeIndex(["2022-01-01 01:00"])
     vestas = _scada_frame(

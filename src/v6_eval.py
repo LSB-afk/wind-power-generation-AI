@@ -262,6 +262,25 @@ def _file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _assert_scada_source_hashes(
+    bundle: TrainingBundle, groups: tuple[str, ...]
+) -> None:
+    """Fail if SCADA bytes changed after weighted-target reconstruction."""
+    sources = {
+        "vestas": ("scada_vestas", TRAIN_DIR / "scada_vestas_train.csv"),
+        "unison": ("scada_unison", TRAIN_DIR / "scada_unison_train.csv"),
+    }
+    makers = {"unison" if group == G3 else "vestas" for group in groups}
+    for maker in sorted(makers):
+        source_name, path = sources[maker]
+        expected = bundle.data_hashes.get(source_name)
+        if expected is None or _file_hash(path) != expected:
+            raise ProvenanceError(
+                f"SCADA source hash changed during weighted target reconstruction: "
+                f"{source_name}"
+            )
+
+
 def feature_hash(features: pd.DataFrame) -> str:
     """Hash feature names, dtypes, index, and values."""
     return _pandas_hash(features)
@@ -1026,6 +1045,7 @@ def fit_fold(
             target_label_years=train_years,
             groups=groups,
         )
+        _assert_scada_source_hashes(bundle, groups)
     row_counts: dict[str, int] = {}
     solo_frames: dict[str, pd.DataFrame] = {}
     validation_frames: dict[str, pd.DataFrame] = {}
