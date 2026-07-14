@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from config import CAPACITY_KWH, GROUPS, ROOT, TRAIN_DIR
-from features import add_context, build_features
+from features import build_features
 from metrics import group_ficr, group_nmae
 from scada import build_mismatch_mask, build_potential
 
@@ -36,8 +36,8 @@ TRAIN_FILTER_RATIO = 0.05
 FLOOR_RATIO = 0.10
 G12 = ("kpx_group_1", "kpx_group_2")
 G3 = "kpx_group_3"
-CACHE_DIR = ROOT / "cache"
 EXPERIMENT_DIR = ROOT / ".omx" / "experiments" / "wind-v6"
+CACHE_SCHEMA_VERSION = 2
 ANCHOR_TOLERANCE = 0.00015
 BASELINE_ANCHORS = {"fold23": 0.6316, "fold24": 0.6380}
 EXPECTED_ROWS = {
@@ -56,6 +56,41 @@ EXPECTED_ROWS = {
         "g3_valid": 8778,
     },
 }
+BASELINE_POSTPROCESS_CONFIG = {
+    "version": 1,
+    "kind": "capacity_clip_then_floor",
+    "clip_min_ratio": 0.0,
+    "clip_max_ratio": 1.0,
+    "floor_ratio": FLOOR_RATIO,
+}
+BASELINE_RECIPE_CONFIG = {
+    "version": 1,
+    "name": BASELINE_RECIPE,
+    "training": {
+        "target": "scada_potential",
+        "exclude_scada_mismatch": True,
+        "filter_ratio": TRAIN_FILTER_RATIO,
+    },
+    "validation": {
+        "target": "raw_generation_label",
+        "fold_strategy": "calendar_year_holdout",
+    },
+    "model": {
+        "library": "lightgbm",
+        "params": dict(BASELINE_PARAMS),
+        "num_boost_round": 5000,
+        "early_stopping_rounds": 200,
+        "seed_aggregation": "arithmetic_mean",
+    },
+    "capacities": dict(CAPACITY_KWH),
+    "group_strategy": {
+        "version": 1,
+        "kpx_group_1": "solo_kwh",
+        "kpx_group_2": "solo_kwh",
+        "kpx_group_3": "pooled_normalized_with_group_id",
+    },
+    "postprocess": dict(BASELINE_POSTPROCESS_CONFIG),
+}
 
 
 class ProvenanceError(ValueError):
@@ -72,17 +107,24 @@ class TrainingBundle:
     feature_columns: tuple[str, ...]
     feature_hash: str
     data_hashes: dict[str, str]
+    derived_data_hashes: dict[str, str]
 
 
 @dataclass(frozen=True)
 class FoldProvenance:
     recipe: str
+    recipe_config: dict[str, object]
+    recipe_hash: str
+    postprocess_config: dict[str, object]
+    postprocess_hash: str
+    cache_schema_version: int
     train_years: tuple[int, ...]
     valid_year: int
     groups: tuple[str, ...]
     seeds: tuple[int, ...]
     feature_hash: str
     data_hashes: dict[str, str]
+    derived_data_hashes: dict[str, str]
     row_counts: dict[str, int]
     validation_index_hashes: dict[str, str]
     target_hashes: dict[str, str]
@@ -102,6 +144,26 @@ def _canonical_hash(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _json_object(value: Mapping[str, object], field_name: str) -> dict[str, object]:
+    """Return a detached, JSON-canonical mapping suitable for provenance."""
+    try:
+        normalized = json.loads(
+            json.dumps(
+                dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ProvenanceError(f"{field_name} must be JSON serializable") from error
+    if not isinstance(normalized, dict):
+        raise ProvenanceError(f"{field_name} must be a JSON object")
+    return normalized
+
+
+def recipe_fingerprint(config: Mapping[str, object]) -> str:
+    """Hash every structured behavior field in a recipe or postprocess config."""
+    return _canonical_hash(_json_object(config, "recipe config"))
 
 
 def _pandas_hash(obj: pd.DataFrame | pd.Series | pd.Index) -> str:
@@ -138,23 +200,31 @@ def feature_hash(features: pd.DataFrame) -> str:
 def manifest_key(
     *,
     recipe: str,
+    recipe_hash: str,
+    postprocess_hash: str,
+    cache_schema_version: int,
     train_years: tuple[int, ...],
     valid_year: int,
     groups: tuple[str, ...],
     seeds: tuple[int, ...],
     feature_hash: str,
     data_hashes: Mapping[str, str],
+    derived_data_hashes: Mapping[str, str] | None = None,
 ) -> str:
     """Return the identity of a requested fold before predictions exist."""
     return _canonical_hash(
         {
             "recipe": recipe,
+            "recipe_hash": recipe_hash,
+            "postprocess_hash": postprocess_hash,
+            "cache_schema_version": int(cache_schema_version),
             "train_years": list(train_years),
             "valid_year": valid_year,
             "groups": list(groups),
             "seeds": list(seeds),
             "feature_hash": feature_hash,
             "data_hashes": dict(sorted(data_hashes.items())),
+            "derived_data_hashes": dict(sorted((derived_data_hashes or {}).items())),
         }
     )
 
@@ -166,8 +236,11 @@ def build_provenance(
     valid_year: int,
     groups: tuple[str, ...],
     seeds: tuple[int, ...],
+    recipe_config: Mapping[str, object],
+    postprocess_config: Mapping[str, object],
     feature_hash: str,
     data_hashes: Mapping[str, str],
+    derived_data_hashes: Mapping[str, str] | None = None,
     row_counts: Mapping[str, int],
     model_predictions: Mapping[str, pd.Series],
     validation_targets: Mapping[str, pd.Series],
@@ -178,15 +251,27 @@ def build_provenance(
         raise ProvenanceError("model prediction group keys do not match groups")
     if tuple(validation_targets) != group_tuple:
         raise ProvenanceError("validation target group keys do not match groups")
+    normalized_recipe = _json_object(recipe_config, "recipe config")
+    normalized_postprocess = _json_object(postprocess_config, "postprocess config")
+    recipe_hash_value = recipe_fingerprint(normalized_recipe)
+    postprocess_hash_value = recipe_fingerprint(normalized_postprocess)
     data_hash_dict = dict(sorted(data_hashes.items()))
+    derived_hash_dict = dict(sorted((derived_data_hashes or {}).items()))
+    seed_tuple = tuple(int(seed) for seed in seeds)
     return FoldProvenance(
         recipe=recipe,
+        recipe_config=normalized_recipe,
+        recipe_hash=recipe_hash_value,
+        postprocess_config=normalized_postprocess,
+        postprocess_hash=postprocess_hash_value,
+        cache_schema_version=CACHE_SCHEMA_VERSION,
         train_years=tuple(train_years),
         valid_year=int(valid_year),
         groups=group_tuple,
-        seeds=tuple(int(seed) for seed in seeds),
+        seeds=seed_tuple,
         feature_hash=feature_hash,
         data_hashes=data_hash_dict,
+        derived_data_hashes=derived_hash_dict,
         row_counts={key: int(value) for key, value in sorted(row_counts.items())},
         validation_index_hashes={
             group: _pandas_hash(model_predictions[group].index) for group in group_tuple
@@ -199,12 +284,16 @@ def build_provenance(
         },
         manifest_key=manifest_key(
             recipe=recipe,
+            recipe_hash=recipe_hash_value,
+            postprocess_hash=postprocess_hash_value,
+            cache_schema_version=CACHE_SCHEMA_VERSION,
             train_years=tuple(train_years),
             valid_year=int(valid_year),
             groups=group_tuple,
-            seeds=tuple(int(seed) for seed in seeds),
+            seeds=seed_tuple,
             feature_hash=feature_hash,
             data_hashes=data_hash_dict,
+            derived_data_hashes=derived_hash_dict,
         ),
     )
 
@@ -216,6 +305,9 @@ def validate_fold_predictions(
     expected_seeds: tuple[int, ...] | None = None,
     expected_feature_hash: str | None = None,
     expected_data_hashes: Mapping[str, str] | None = None,
+    expected_derived_data_hashes: Mapping[str, str] | None = None,
+    expected_recipe_hash: str | None = None,
+    expected_postprocess_hash: str | None = None,
 ) -> None:
     """Fail unless fold values and all declared provenance agree exactly."""
     provenance = fold.provenance
@@ -228,15 +320,25 @@ def validate_fold_predictions(
         raise ProvenanceError("validation target group keys do not match provenance")
     if not provenance.seeds:
         raise ProvenanceError("fold has no seeds")
+    if provenance.cache_schema_version != CACHE_SCHEMA_VERSION:
+        raise ProvenanceError("cache schema version does not match evaluator")
+    if provenance.recipe_hash != recipe_fingerprint(provenance.recipe_config):
+        raise ProvenanceError("recipe config fingerprint does not match")
+    if provenance.postprocess_hash != recipe_fingerprint(provenance.postprocess_config):
+        raise ProvenanceError("postprocess config fingerprint does not match")
 
     expected_key = manifest_key(
         recipe=provenance.recipe,
+        recipe_hash=provenance.recipe_hash,
+        postprocess_hash=provenance.postprocess_hash,
+        cache_schema_version=provenance.cache_schema_version,
         train_years=provenance.train_years,
         valid_year=provenance.valid_year,
         groups=groups,
         seeds=provenance.seeds,
         feature_hash=provenance.feature_hash,
         data_hashes=provenance.data_hashes,
+        derived_data_hashes=provenance.derived_data_hashes,
     )
     if provenance.manifest_key != expected_key:
         raise ProvenanceError("manifest key does not match fold metadata")
@@ -248,14 +350,21 @@ def validate_fold_predictions(
         if provenance.row_counts.get(row_count_key) != len(prediction):
             raise ProvenanceError(f"{group} validation row count does not match")
         if not isinstance(prediction, pd.Series) or not isinstance(target, pd.Series):
-            raise ProvenanceError(f"{group} predictions and targets must be indexed Series")
+            raise ProvenanceError(
+                f"{group} predictions and targets must be indexed Series"
+            )
         if prediction.shape != target.shape:
             raise ProvenanceError(f"{group} prediction and target shapes differ")
         if not prediction.index.equals(target.index):
             raise ProvenanceError(f"{group} validation index differs from target index")
-        if not prediction.index.is_unique or not prediction.index.is_monotonic_increasing:
+        if (
+            not prediction.index.is_unique
+            or not prediction.index.is_monotonic_increasing
+        ):
             raise ProvenanceError(f"{group} validation index must be unique and sorted")
-        if provenance.validation_index_hashes.get(group) != _pandas_hash(prediction.index):
+        if provenance.validation_index_hashes.get(group) != _pandas_hash(
+            prediction.index
+        ):
             raise ProvenanceError(f"{group} validation index hash does not match")
         if provenance.target_hashes.get(group) != _pandas_hash(target):
             raise ProvenanceError(f"{group} target hash does not match")
@@ -266,12 +375,31 @@ def validate_fold_predictions(
         raise ProvenanceError("recipe does not match requested recipe")
     if expected_seeds is not None and provenance.seeds != tuple(expected_seeds):
         raise ProvenanceError("seeds do not match requested seeds")
-    if expected_feature_hash is not None and provenance.feature_hash != expected_feature_hash:
+    if (
+        expected_feature_hash is not None
+        and provenance.feature_hash != expected_feature_hash
+    ):
         raise ProvenanceError("feature hash does not match requested features")
     if expected_data_hashes is not None and provenance.data_hashes != dict(
         sorted(expected_data_hashes.items())
     ):
         raise ProvenanceError("data hashes do not match requested data")
+    if (
+        expected_derived_data_hashes is not None
+        and provenance.derived_data_hashes
+        != dict(sorted(expected_derived_data_hashes.items()))
+    ):
+        raise ProvenanceError("derived data hashes do not match requested data")
+    if (
+        expected_recipe_hash is not None
+        and provenance.recipe_hash != expected_recipe_hash
+    ):
+        raise ProvenanceError("recipe fingerprint does not match requested recipe")
+    if (
+        expected_postprocess_hash is not None
+        and provenance.postprocess_hash != expected_postprocess_hash
+    ):
+        raise ProvenanceError("postprocess fingerprint does not match requested config")
 
 
 def assert_fold_alignment(
@@ -295,6 +423,19 @@ def assert_fold_alignment(
         raise ProvenanceError("data hashes differ")
     if require_feature_hash and base.feature_hash != other.feature_hash:
         raise ProvenanceError("feature hashes differ")
+    if (
+        base.postprocess_config != other.postprocess_config
+        or base.postprocess_hash != other.postprocess_hash
+    ):
+        raise ProvenanceError("postprocess provenance differs")
+    base_validation_rows = {
+        key: value for key, value in base.row_counts.items() if key.endswith("_valid")
+    }
+    other_validation_rows = {
+        key: value for key, value in other.row_counts.items() if key.endswith("_valid")
+    }
+    if base_validation_rows != other_validation_rows:
+        raise ProvenanceError("validation row metadata differs")
     for group in base.groups:
         base_prediction = baseline.model_predictions[group]
         other_prediction = candidate.model_predictions[group]
@@ -302,6 +443,12 @@ def assert_fold_alignment(
             raise ProvenanceError(f"{group} validation shapes differ")
         if not base_prediction.index.equals(other_prediction.index):
             raise ProvenanceError(f"{group} validation index differs")
+        if base.target_hashes[group] != other.target_hashes[
+            group
+        ] or not baseline.validation_targets[group].equals(
+            candidate.validation_targets[group]
+        ):
+            raise ProvenanceError(f"{group} validation targets differ")
 
 
 def apply_floor10(values: np.ndarray | pd.Series, capacity: float):
@@ -317,11 +464,11 @@ def gate_scores(
     candidate: dict[str, float],
     min_mean_delta: float = 0.001,
 ) -> dict:
-    deltas = {
-        fold: candidate[fold] - baseline[fold] for fold in ("fold23", "fold24")
-    }
+    deltas = {fold: candidate[fold] - baseline[fold] for fold in ("fold23", "fold24")}
     mean_delta = sum(deltas.values()) / 2.0
-    passed = all(delta > 0.0 for delta in deltas.values()) and mean_delta >= min_mean_delta
+    passed = (
+        all(delta > 0.0 for delta in deltas.values()) and mean_delta >= min_mean_delta
+    )
     return {
         "status": "PASS" if passed else "FAIL",
         "baseline": baseline,
@@ -345,21 +492,12 @@ def blend_predictions(
 
 
 def load_scada_targets(
-    labels: pd.DataFrame, *, cache_dir: Path = CACHE_DIR
+    labels: pd.DataFrame, *, cache_dir: Path | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load ignored SCADA frames, rebuilding each missing frame from raw files."""
-    potential_path = cache_dir / "scada_potential.parquet"
-    mismatch_path = cache_dir / "scada_mismatch.parquet"
-    potential = (
-        pd.read_parquet(potential_path)
-        if potential_path.is_file()
-        else build_potential(labels)
-    )
-    mismatch = (
-        pd.read_parquet(mismatch_path)
-        if mismatch_path.is_file()
-        else build_mismatch_mask(labels)
-    )
+    """Rebuild SCADA-derived targets from raw CSVs for this process."""
+    _ = cache_dir  # Retained only for call-site compatibility; disk caches are unsafe.
+    potential = build_potential(labels)
+    mismatch = build_mismatch_mask(labels)
     return potential.reindex(labels.index), mismatch.reindex(labels.index)
 
 
@@ -380,19 +518,9 @@ def load_bundle() -> TrainingBundle:
         index_col="kst_dtm",
     ).sort_index()
 
-    base_path = CACHE_DIR / "train_base.parquet"
-    ldaps_cache_path = CACHE_DIR / "train_ldaps_raw.parquet"
-    if base_path.is_file() and ldaps_cache_path.is_file():
-        base_features = pd.read_parquet(base_path)
-        ldaps_raw = pd.read_parquet(ldaps_cache_path)
-        available_at = ldaps_raw.drop_duplicates("forecast_kst_dtm").set_index(
-            "forecast_kst_dtm"
-        )["data_available_kst_dtm"]
-        features = add_context(base_features, available_at).sort_index()
-    else:
-        features = build_features(
-            TRAIN_DIR / "ldaps_train.csv", TRAIN_DIR / "gfs_train.csv"
-        ).sort_index()
+    features = build_features(
+        TRAIN_DIR / "ldaps_train.csv", TRAIN_DIR / "gfs_train.csv"
+    ).sort_index()
 
     potential, mismatch = load_scada_targets(labels)
     data = features.join(labels, how="inner")
@@ -404,8 +532,10 @@ def load_bundle() -> TrainingBundle:
         "scada_unison": TRAIN_DIR / "scada_unison_train.csv",
     }
     data_hashes = {name: _file_hash(path) for name, path in source_paths.items()}
-    data_hashes["potential_frame"] = _pandas_hash(potential)
-    data_hashes["mismatch_frame"] = _pandas_hash(mismatch)
+    derived_data_hashes = {
+        "potential_frame": _pandas_hash(potential),
+        "mismatch_frame": _pandas_hash(mismatch),
+    }
     _BUNDLE = TrainingBundle(
         features=features,
         labels=labels,
@@ -415,6 +545,7 @@ def load_bundle() -> TrainingBundle:
         feature_columns=tuple(features.columns),
         feature_hash=feature_hash(features),
         data_hashes=dict(sorted(data_hashes.items())),
+        derived_data_hashes=dict(sorted(derived_data_hashes.items())),
     )
     return _BUNDLE
 
@@ -439,7 +570,9 @@ def _pooled_train_frame(
     for group in GROUPS:
         frame = bundle.data.dropna(subset=[group]).copy()
         frame["_target"] = bundle.potential[f"{group}_potential"].reindex(frame.index)
-        mismatch = bundle.mismatch[f"{group}_mismatch"].reindex(frame.index).fillna(False)
+        mismatch = (
+            bundle.mismatch[f"{group}_mismatch"].reindex(frame.index).fillna(False)
+        )
         frame = frame[~mismatch].dropna(subset=["_target"])
         normalized = frame[list(columns)].copy()
         normalized["normalized_target"] = frame["_target"] / CAPACITY_KWH[group]
@@ -479,9 +612,7 @@ def _fit_ensemble(
             callbacks=[lgb.early_stopping(200, verbose=False)],
         )
         predictions.append(
-            model.predict(
-                validation_features, num_iteration=model.best_iteration
-            )
+            model.predict(validation_features, num_iteration=model.best_iteration)
         )
     return np.mean(predictions, axis=0)
 
@@ -499,9 +630,17 @@ def assert_baseline_fingerprint(fold_name: str, row_counts: Mapping[str, int]) -
         )
 
 
-def assert_score_anchor(fold_name: str, score: float) -> None:
+def assert_score_anchor(
+    fold_name: str, score: float, *, seeds: tuple[int, ...]
+) -> None:
+    if tuple(int(seed) for seed in seeds) != (42,):
+        return
     expected = BASELINE_ANCHORS.get(fold_name)
-    if expected is None or not np.isfinite(score) or abs(score - expected) > ANCHOR_TOLERANCE:
+    if (
+        expected is None
+        or not np.isfinite(score)
+        or abs(score - expected) > ANCHOR_TOLERANCE
+    ):
         raise ProvenanceError(
             f"{fold_name} score anchor drift: expected {expected} +/- "
             f"{ANCHOR_TOLERANCE}, got {score}"
@@ -518,19 +657,16 @@ def _cache_paths(cache_dir: Path, key: str) -> tuple[Path, Path]:
 def write_prediction_cache(
     fold: FoldPredictions, cache_dir: Path = EXPERIMENT_DIR
 ) -> Path:
-    """Persist predictions and a complete, hash-verifiable JSON manifest."""
+    """Persist predictions plus checksums; validation targets remain live-only."""
     validate_fold_predictions(fold)
     cache_dir.mkdir(parents=True, exist_ok=True)
     provenance = fold.provenance
-    predictions_path, manifest_path = _cache_paths(
-        cache_dir, provenance.manifest_key
-    )
+    predictions_path, manifest_path = _cache_paths(cache_dir, provenance.manifest_key)
     arrays: dict[str, np.ndarray] = {}
     for group in provenance.groups:
         suffix = group.rsplit("_", 1)[-1]
         arrays[f"g{suffix}_index_ns"] = fold.model_predictions[group].index.asi8
         arrays[f"g{suffix}_prediction"] = fold.model_predictions[group].to_numpy()
-        arrays[f"g{suffix}_target"] = fold.validation_targets[group].to_numpy()
     temporary_predictions = predictions_path.with_suffix(".tmp.npz")
     with temporary_predictions.open("wb") as handle:
         np.savez_compressed(handle, **arrays)
@@ -539,7 +675,7 @@ def write_prediction_cache(
     manifest = asdict(provenance)
     manifest.update(
         {
-            "schema_version": 1,
+            "schema_version": CACHE_SCHEMA_VERSION,
             "predictions_file": predictions_path.name,
         }
     )
@@ -559,89 +695,167 @@ def _read_prediction_cache(
     valid_year: int,
     groups: tuple[str, ...],
     seeds: tuple[int, ...],
+    recipe_fingerprint: str,
+    postprocess_config: Mapping[str, object],
     feature_fingerprint: str,
     data_hashes: Mapping[str, str],
+    derived_data_hashes: Mapping[str, str] | None = None,
     row_counts: Mapping[str, int],
+    live_validation_targets: Mapping[str, pd.Series],
 ) -> FoldPredictions | None:
+    normalized_postprocess = _json_object(postprocess_config, "postprocess config")
+    postprocess_hash = _canonical_hash(normalized_postprocess)
+    normalized_derived_hashes = dict(sorted((derived_data_hashes or {}).items()))
     key = manifest_key(
         recipe=recipe,
+        recipe_hash=recipe_fingerprint,
+        postprocess_hash=postprocess_hash,
+        cache_schema_version=CACHE_SCHEMA_VERSION,
         train_years=train_years,
         valid_year=valid_year,
         groups=groups,
         seeds=seeds,
         feature_hash=feature_fingerprint,
         data_hashes=data_hashes,
+        derived_data_hashes=normalized_derived_hashes,
     )
     predictions_path, manifest_path = _cache_paths(cache_dir, key)
     if not predictions_path.exists() and not manifest_path.exists():
         return None
     if not predictions_path.is_file() or not manifest_path.is_file():
         raise ProvenanceError("prediction cache is incomplete")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    required = {
-        "recipe",
-        "train_years",
-        "valid_year",
-        "groups",
-        "seeds",
-        "feature_hash",
-        "data_hashes",
-        "row_counts",
-        "validation_index_hashes",
-        "target_hashes",
-        "prediction_hashes",
-        "manifest_key",
-        "predictions_file",
-    }
-    if not required <= manifest.keys():
-        raise ProvenanceError("prediction cache manifest is missing provenance")
-    if manifest["manifest_key"] != key or manifest["predictions_file"] != predictions_path.name:
-        raise ProvenanceError("prediction cache manifest key or file does not match")
-    if manifest["row_counts"] != dict(row_counts):
-        raise ProvenanceError("prediction cache row fingerprint does not match")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        required = {
+            "recipe",
+            "recipe_config",
+            "recipe_hash",
+            "postprocess_config",
+            "postprocess_hash",
+            "cache_schema_version",
+            "schema_version",
+            "train_years",
+            "valid_year",
+            "groups",
+            "seeds",
+            "feature_hash",
+            "data_hashes",
+            "derived_data_hashes",
+            "row_counts",
+            "validation_index_hashes",
+            "target_hashes",
+            "prediction_hashes",
+            "manifest_key",
+            "predictions_file",
+        }
+        if not isinstance(manifest, dict) or not required <= manifest.keys():
+            raise ProvenanceError("prediction cache manifest is missing provenance")
+        if (
+            manifest["schema_version"] != CACHE_SCHEMA_VERSION
+            or manifest["cache_schema_version"] != CACHE_SCHEMA_VERSION
+        ):
+            raise ProvenanceError("prediction cache schema version does not match")
 
-    model_predictions: dict[str, pd.Series] = {}
-    validation_targets: dict[str, pd.Series] = {}
-    with np.load(predictions_path, allow_pickle=False) as arrays:
+        manifest_recipe_config = _json_object(
+            manifest["recipe_config"], "recipe config"
+        )
+        if _canonical_hash(manifest_recipe_config) != recipe_fingerprint:
+            raise ProvenanceError("prediction cache recipe fingerprint does not match")
+        expected_metadata = {
+            "recipe": recipe,
+            "recipe_hash": recipe_fingerprint,
+            "postprocess_config": normalized_postprocess,
+            "postprocess_hash": postprocess_hash,
+            "train_years": list(train_years),
+            "valid_year": valid_year,
+            "groups": list(groups),
+            "seeds": list(seeds),
+            "feature_hash": feature_fingerprint,
+            "data_hashes": dict(sorted(data_hashes.items())),
+            "derived_data_hashes": normalized_derived_hashes,
+            "row_counts": {
+                name: int(count) for name, count in sorted(row_counts.items())
+            },
+            "manifest_key": key,
+            "predictions_file": predictions_path.name,
+        }
+        if any(manifest[field] != value for field, value in expected_metadata.items()):
+            raise ProvenanceError("prediction cache metadata does not match request")
+        if tuple(live_validation_targets) != tuple(groups):
+            raise ProvenanceError(
+                "prediction cache live validation target groups do not match"
+            )
+
+        validation_targets: dict[str, pd.Series] = {}
         for group in groups:
-            suffix = group.rsplit("_", 1)[-1]
-            index = pd.DatetimeIndex(arrays[f"g{suffix}_index_ns"])
-            model_predictions[group] = pd.Series(
-                arrays[f"g{suffix}_prediction"],
-                index=index,
-                name=group,
-            )
-            validation_targets[group] = pd.Series(
-                arrays[f"g{suffix}_target"],
-                index=index,
-                name=group,
-            )
-    provenance = build_provenance(
-        recipe=recipe,
-        train_years=train_years,
-        valid_year=valid_year,
-        groups=groups,
-        seeds=seeds,
-        feature_hash=feature_fingerprint,
-        data_hashes=data_hashes,
-        row_counts=row_counts,
-        model_predictions=model_predictions,
-        validation_targets=validation_targets,
-    )
-    serialized_provenance = json.loads(json.dumps(asdict(provenance)))
-    if serialized_provenance != {
-        field: manifest[field] for field in serialized_provenance
-    }:
-        raise ProvenanceError("prediction cache hashes do not match manifest")
-    fold = FoldPredictions(model_predictions, validation_targets, provenance)
-    validate_fold_predictions(
-        fold,
-        expected_recipe=recipe,
-        expected_seeds=seeds,
-        expected_feature_hash=feature_fingerprint,
-        expected_data_hashes=data_hashes,
-    )
-    return fold
+            target = live_validation_targets[group]
+            if not isinstance(target, pd.Series):
+                raise ProvenanceError(
+                    f"prediction cache live validation target for {group} is not a Series"
+                )
+            if manifest["validation_index_hashes"].get(group) != _pandas_hash(
+                target.index
+            ):
+                raise ProvenanceError(
+                    f"prediction cache live validation index for {group} differs"
+                )
+            if manifest["target_hashes"].get(group) != _pandas_hash(target):
+                raise ProvenanceError(
+                    f"prediction cache live validation target for {group} differs"
+                )
+            validation_targets[group] = target
+
+        model_predictions: dict[str, pd.Series] = {}
+        with np.load(predictions_path, allow_pickle=False) as arrays:
+            for group in groups:
+                suffix = group.rsplit("_", 1)[-1]
+                index = pd.DatetimeIndex(arrays[f"g{suffix}_index_ns"])
+                if not index.equals(validation_targets[group].index):
+                    raise ProvenanceError(
+                        f"prediction cache live validation index for {group} differs"
+                    )
+                model_predictions[group] = pd.Series(
+                    arrays[f"g{suffix}_prediction"],
+                    index=index,
+                    name=group,
+                )
+
+        provenance = build_provenance(
+            recipe=recipe,
+            train_years=train_years,
+            valid_year=valid_year,
+            groups=groups,
+            seeds=seeds,
+            recipe_config=manifest_recipe_config,
+            postprocess_config=normalized_postprocess,
+            feature_hash=feature_fingerprint,
+            data_hashes=data_hashes,
+            derived_data_hashes=normalized_derived_hashes,
+            row_counts=row_counts,
+            model_predictions=model_predictions,
+            validation_targets=validation_targets,
+        )
+        serialized_provenance = json.loads(json.dumps(asdict(provenance)))
+        if serialized_provenance != {
+            field: manifest[field] for field in serialized_provenance
+        }:
+            raise ProvenanceError("prediction cache hashes do not match manifest")
+        fold = FoldPredictions(model_predictions, validation_targets, provenance)
+        validate_fold_predictions(
+            fold,
+            expected_recipe=recipe,
+            expected_seeds=seeds,
+            expected_feature_hash=feature_fingerprint,
+            expected_data_hashes=data_hashes,
+            expected_derived_data_hashes=normalized_derived_hashes,
+            expected_recipe_hash=recipe_fingerprint,
+            expected_postprocess_hash=postprocess_hash,
+        )
+        return fold
+    except ProvenanceError:
+        raise
+    except Exception as error:
+        raise ProvenanceError(f"prediction cache is malformed: {error}") from error
 
 
 def fit_fold(
@@ -664,7 +878,9 @@ def fit_fold(
         ((2022, 2023), 2024, tuple(GROUPS)),
     }
     if (train_years, valid_year, groups) not in expected_fold:
-        raise ValueError("baseline evaluator supports only the frozen fold23/fold24 splits")
+        raise ValueError(
+            "baseline evaluator supports only the frozen fold23/fold24 splits"
+        )
 
     bundle = load_bundle()
     row_counts: dict[str, int] = {}
@@ -687,6 +903,10 @@ def fit_fold(
     row_counts = dict(sorted(row_counts.items()))
     fold_name = _fold_name(valid_year)
     assert_baseline_fingerprint(fold_name, row_counts)
+    validation_targets = {
+        group: validation_frames[group][group].copy().rename(group) for group in groups
+    }
+    baseline_recipe_hash = recipe_fingerprint(BASELINE_RECIPE_CONFIG)
 
     cached = _read_prediction_cache(
         cache_dir=EXPERIMENT_DIR,
@@ -695,20 +915,23 @@ def fit_fold(
         valid_year=valid_year,
         groups=groups,
         seeds=seeds,
+        recipe_fingerprint=baseline_recipe_hash,
+        postprocess_config=BASELINE_POSTPROCESS_CONFIG,
         feature_fingerprint=bundle.feature_hash,
         data_hashes=bundle.data_hashes,
+        derived_data_hashes=bundle.derived_data_hashes,
         row_counts=row_counts,
+        live_validation_targets=validation_targets,
     )
     if cached is not None:
         return cached
 
     model_predictions: dict[str, pd.Series] = {}
-    validation_targets: dict[str, pd.Series] = {}
     columns = list(bundle.feature_columns)
     for group in groups:
         capacity = CAPACITY_KWH[group]
         validation = validation_frames[group]
-        validation_target = validation[group].copy()
+        validation_target = validation_targets[group]
         if group in G12:
             train = solo_frames[group]
             raw_prediction = _fit_ensemble(
@@ -723,19 +946,21 @@ def fit_fold(
                 raise ProvenanceError("pooled training frame is missing")
             validation_features = validation[columns].copy()
             validation_features["group_id"] = 3
-            raw_prediction = _fit_ensemble(
-                pooled_frame[list(pooled_columns)],
-                pooled_frame["normalized_target"],
-                validation_features[list(pooled_columns)],
-                validation_target / capacity,
-                seeds,
-                categorical=("group_id",),
-            ) * capacity
+            raw_prediction = (
+                _fit_ensemble(
+                    pooled_frame[list(pooled_columns)],
+                    pooled_frame["normalized_target"],
+                    validation_features[list(pooled_columns)],
+                    validation_target / capacity,
+                    seeds,
+                    categorical=("group_id",),
+                )
+                * capacity
+            )
         clipped = np.clip(raw_prediction, 0.0, capacity)
         model_predictions[group] = pd.Series(
             apply_floor10(clipped, capacity), index=validation.index, name=group
         )
-        validation_targets[group] = validation_target.rename(group)
 
     provenance = build_provenance(
         recipe=recipe,
@@ -743,8 +968,11 @@ def fit_fold(
         valid_year=valid_year,
         groups=groups,
         seeds=seeds,
+        recipe_config=BASELINE_RECIPE_CONFIG,
+        postprocess_config=BASELINE_POSTPROCESS_CONFIG,
         feature_hash=bundle.feature_hash,
         data_hashes=bundle.data_hashes,
+        derived_data_hashes=bundle.derived_data_hashes,
         row_counts=row_counts,
         model_predictions=model_predictions,
         validation_targets=validation_targets,
@@ -756,6 +984,9 @@ def fit_fold(
         expected_seeds=seeds,
         expected_feature_hash=bundle.feature_hash,
         expected_data_hashes=bundle.data_hashes,
+        expected_derived_data_hashes=bundle.derived_data_hashes,
+        expected_recipe_hash=baseline_recipe_hash,
+        expected_postprocess_hash=recipe_fingerprint(BASELINE_POSTPROCESS_CONFIG),
     )
     write_prediction_cache(fold)
     return fold
@@ -764,6 +995,21 @@ def fit_fold(
 def score_fold(predictions: FoldPredictions) -> float:
     """Score only a fully indexed, hash-verified fold."""
     validate_fold_predictions(predictions)
+    provenance = predictions.provenance
+    if provenance.recipe == BASELINE_RECIPE:
+        if provenance.recipe_config != _json_object(
+            BASELINE_RECIPE_CONFIG, "baseline recipe config"
+        ) or provenance.recipe_hash != recipe_fingerprint(BASELINE_RECIPE_CONFIG):
+            raise ProvenanceError("baseline recipe config drift")
+        if provenance.postprocess_config != _json_object(
+            BASELINE_POSTPROCESS_CONFIG, "baseline postprocess config"
+        ) or provenance.postprocess_hash != recipe_fingerprint(
+            BASELINE_POSTPROCESS_CONFIG
+        ):
+            raise ProvenanceError("baseline postprocess config drift")
+        assert_baseline_fingerprint(
+            _fold_name(provenance.valid_year), provenance.row_counts
+        )
     nmaes = []
     ficrs = []
     for group in predictions.provenance.groups:
@@ -781,16 +1027,20 @@ def score_fold(predictions: FoldPredictions) -> float:
 def run_stage7(seeds: tuple[int, ...], baseline_only: bool = False) -> int:
     """Reproduce the frozen baseline; remain fail-closed until a candidate exists."""
     seeds = tuple(int(seed) for seed in seeds)
+    if not baseline_only:
+        print(
+            "stage7 candidate evaluation is not implemented yet; use --baseline-only",
+            file=sys.stderr,
+        )
+        return 2
     try:
         fold23 = fit_fold(BASELINE_RECIPE, (2022,), 2023, G12, seeds)
-        fold24 = fit_fold(
-            BASELINE_RECIPE, (2022, 2023), 2024, tuple(GROUPS), seeds
-        )
+        fold24 = fit_fold(BASELINE_RECIPE, (2022, 2023), 2024, tuple(GROUPS), seeds)
         assert_baseline_fingerprint("fold23", fold23.provenance.row_counts)
         assert_baseline_fingerprint("fold24", fold24.provenance.row_counts)
         scores = {"fold23": score_fold(fold23), "fold24": score_fold(fold24)}
         for fold_name, score in scores.items():
-            assert_score_anchor(fold_name, score)
+            assert_score_anchor(fold_name, score, seeds=seeds)
             print(f"[{fold_name}] frozen v5 C1 score={score:.6f}")
         result = {
             "status": "BASELINE_OK",
@@ -803,14 +1053,14 @@ def run_stage7(seeds: tuple[int, ...], baseline_only: bool = False) -> int:
             },
         }
         print(json.dumps(result, sort_keys=True))
-    except (ProvenanceError, ValueError, OSError, KeyError, json.JSONDecodeError) as error:
+    except (
+        ProvenanceError,
+        ValueError,
+        OSError,
+        KeyError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"stage7 baseline rejected: {error}", file=sys.stderr)
         return 2
 
-    if not baseline_only:
-        print(
-            "stage7 candidate evaluation is not implemented yet; use --baseline-only",
-            file=sys.stderr,
-        )
-        return 2
     return 0

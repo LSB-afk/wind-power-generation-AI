@@ -1,3 +1,4 @@
+from copy import deepcopy
 from dataclasses import replace
 import json
 import sys
@@ -37,6 +38,11 @@ def _synthetic_fold(
     seeds: tuple[int, ...] = (42,),
     feature_fingerprint: str = "feature-sha",
     data_hashes: dict[str, str] | None = None,
+    derived_data_hashes: dict[str, str] | None = None,
+    recipe_config: dict | None = None,
+    postprocess_config: dict | None = None,
+    row_counts: dict[str, int] | None = None,
+    target_shift: float = 0.0,
 ) -> FoldPredictions:
     group = "kpx_group_1"
     model_predictions = {
@@ -46,7 +52,9 @@ def _synthetic_fold(
     }
     validation_targets = {
         group: pd.Series(
-            np.linspace(3200.0, 4200.0, len(index)), index=index, name=group
+            np.linspace(3200.0, 4200.0, len(index)) + target_shift,
+            index=index,
+            name=group,
         )
     }
     provenance = build_provenance(
@@ -55,9 +63,13 @@ def _synthetic_fold(
         valid_year=2023,
         groups=(group,),
         seeds=seeds,
+        recipe_config=recipe_config or {"name": recipe, "version": 1},
+        postprocess_config=postprocess_config
+        or {"kind": "capacity_floor", "floor_ratio": 0.10, "version": 1},
         feature_hash=feature_fingerprint,
         data_hashes=data_hashes or {"labels": "labels-sha"},
-        row_counts={"g1_train": 2, "g1_valid": len(index)},
+        derived_data_hashes=derived_data_hashes or {"potential": "potential-sha"},
+        row_counts=row_counts or {"g1_train": 2, "g1_valid": len(index)},
         model_predictions=model_predictions,
         validation_targets=validation_targets,
     )
@@ -143,13 +155,60 @@ def test_fold_alignment_requires_identical_seeds_and_data_hashes():
         )
 
 
+def test_fold_alignment_requires_exact_live_targets_and_validation_rows():
+    index = pd.date_range("2023-01-01", periods=3, freq="h")
+    baseline = _synthetic_fold(index)
+
+    with pytest.raises(ProvenanceError, match="validation targets"):
+        assert_fold_alignment(
+            baseline,
+            _synthetic_fold(index, recipe="candidate", target_shift=1.0),
+        )
+    with pytest.raises(ProvenanceError, match="validation row metadata"):
+        assert_fold_alignment(
+            baseline,
+            _synthetic_fold(
+                index,
+                recipe="candidate",
+                row_counts={"g1_train": 2, "g1_valid": 3, "g2_valid": 0},
+            ),
+        )
+
+
+def test_fold_alignment_requires_exact_structured_postprocess():
+    index = pd.date_range("2023-01-01", periods=3, freq="h")
+    baseline = _synthetic_fold(index)
+    different_floor = _synthetic_fold(
+        index,
+        recipe="candidate",
+        postprocess_config={
+            "kind": "capacity_floor",
+            "floor_ratio": 0.20,
+            "version": 1,
+        },
+    )
+
+    with pytest.raises(ProvenanceError, match="postprocess"):
+        assert_fold_alignment(baseline, different_floor)
+
+
+def test_fold_alignment_allows_recipe_specific_derived_training_targets():
+    index = pd.date_range("2023-01-01", periods=3, freq="h")
+    baseline = _synthetic_fold(index)
+    candidate = _synthetic_fold(
+        index,
+        recipe="candidate",
+        derived_data_hashes={"weighted_potential": "candidate-target-sha"},
+    )
+
+    assert_fold_alignment(baseline, candidate)
+
+
 def test_floor10_only_raises_predictions_below_the_floor():
     capacity = 21600.0
     already_safe = np.array([2160.0, 2160.1, 5000.0, 21600.0])
 
-    np.testing.assert_array_equal(
-        apply_floor10(already_safe, capacity), already_safe
-    )
+    np.testing.assert_array_equal(apply_floor10(already_safe, capacity), already_safe)
     np.testing.assert_array_equal(
         apply_floor10(np.array([0.0, 2159.9]), capacity),
         np.array([2160.0, 2160.0]),
@@ -162,23 +221,62 @@ def test_manifest_key_changes_with_seed_or_feature_name():
     renamed_features = features.rename(columns={"wind_speed": "hub_wind_speed"})
     common = {
         "recipe": "v5-c1",
+        "recipe_hash": "recipe-sha",
+        "postprocess_hash": "postprocess-sha",
+        "cache_schema_version": 2,
         "train_years": (2022,),
         "valid_year": 2023,
         "groups": ("kpx_group_1", "kpx_group_2"),
         "data_hashes": {"labels": "labels-sha"},
     }
 
-    original = manifest_key(
-        **common, seeds=(42,), feature_hash=feature_hash(features)
-    )
+    original = manifest_key(**common, seeds=(42,), feature_hash=feature_hash(features))
     changed_seed = manifest_key(
         **common, seeds=(202,), feature_hash=feature_hash(features)
     )
     changed_feature = manifest_key(
         **common, seeds=(42,), feature_hash=feature_hash(renamed_features)
     )
+    changed_derived_target = manifest_key(
+        **common,
+        seeds=(42,),
+        feature_hash=feature_hash(features),
+        derived_data_hashes={"weighted_potential": "candidate-target-sha"},
+    )
 
-    assert len({original, changed_seed, changed_feature}) == 3
+    assert len({original, changed_seed, changed_feature, changed_derived_target}) == 4
+
+
+def test_recipe_fingerprint_covers_every_frozen_c1_behavior():
+    import v6_eval
+
+    original = deepcopy(v6_eval.BASELINE_RECIPE_CONFIG)
+    variants = []
+
+    changed_alpha = deepcopy(original)
+    changed_alpha["model"]["params"]["alpha"] = 0.61
+    variants.append(changed_alpha)
+
+    changed_filter = deepcopy(original)
+    changed_filter["training"]["filter_ratio"] = 0.06
+    variants.append(changed_filter)
+
+    changed_floor = deepcopy(original)
+    changed_floor["postprocess"]["floor_ratio"] = 0.11
+    variants.append(changed_floor)
+
+    changed_capacity = deepcopy(original)
+    changed_capacity["capacities"]["kpx_group_1"] += 1.0
+    variants.append(changed_capacity)
+
+    changed_strategy = deepcopy(original)
+    changed_strategy["group_strategy"]["kpx_group_3"] = "solo"
+    variants.append(changed_strategy)
+
+    hashes = {v6_eval.recipe_fingerprint(original)}
+    hashes.update(v6_eval.recipe_fingerprint(variant) for variant in variants)
+
+    assert len(hashes) == 1 + len(variants)
 
 
 def test_provenance_rejects_tampered_predictions_and_metadata():
@@ -233,6 +331,10 @@ def test_prediction_cache_manifest_contains_complete_provenance(tmp_path):
 
     assert {
         "recipe",
+        "recipe_config",
+        "recipe_hash",
+        "postprocess_config",
+        "postprocess_hash",
         "seeds",
         "feature_hash",
         "data_hashes",
@@ -240,6 +342,7 @@ def test_prediction_cache_manifest_contains_complete_provenance(tmp_path):
         "prediction_hashes",
     } <= manifest.keys()
     assert manifest["manifest_key"] == fold.provenance.manifest_key
+    assert manifest["schema_version"] == 2
     assert (tmp_path / manifest["predictions_file"]).is_file()
 
 
@@ -256,9 +359,16 @@ def test_prediction_cache_round_trip_revalidates_every_hash(tmp_path):
         valid_year=fold.provenance.valid_year,
         groups=fold.provenance.groups,
         seeds=fold.provenance.seeds,
+        recipe_fingerprint=fold.provenance.recipe_hash,
+        postprocess_config=fold.provenance.postprocess_config,
         feature_fingerprint=fold.provenance.feature_hash,
         data_hashes=fold.provenance.data_hashes,
+        derived_data_hashes=fold.provenance.derived_data_hashes,
         row_counts=fold.provenance.row_counts,
+        live_validation_targets={
+            group: fold.validation_targets[group].copy()
+            for group in fold.provenance.groups
+        },
     )
 
     assert loaded is not None
@@ -275,9 +385,88 @@ def test_prediction_cache_round_trip_revalidates_every_hash(tmp_path):
         )
 
 
-def test_scada_targets_build_from_raw_when_ignored_caches_are_absent(
-    monkeypatch, tmp_path
+def test_prediction_cache_returns_live_targets_and_rejects_live_drift(tmp_path):
+    import v6_eval
+
+    fold = _synthetic_fold(pd.date_range("2023-01-01", periods=2, freq="h"))
+    write_prediction_cache(fold, tmp_path)
+    live_targets = {
+        group: fold.validation_targets[group].copy() for group in fold.provenance.groups
+    }
+    kwargs = {
+        "cache_dir": tmp_path,
+        "recipe": fold.provenance.recipe,
+        "train_years": fold.provenance.train_years,
+        "valid_year": fold.provenance.valid_year,
+        "groups": fold.provenance.groups,
+        "seeds": fold.provenance.seeds,
+        "recipe_fingerprint": fold.provenance.recipe_hash,
+        "postprocess_config": fold.provenance.postprocess_config,
+        "feature_fingerprint": fold.provenance.feature_hash,
+        "data_hashes": fold.provenance.data_hashes,
+        "derived_data_hashes": fold.provenance.derived_data_hashes,
+        "row_counts": fold.provenance.row_counts,
+    }
+
+    loaded = v6_eval._read_prediction_cache(
+        **kwargs, live_validation_targets=live_targets
+    )
+
+    assert loaded is not None
+    for group in fold.provenance.groups:
+        assert loaded.validation_targets[group] is live_targets[group]
+
+    changed_values = {group: target + 1.0 for group, target in live_targets.items()}
+    with pytest.raises(ProvenanceError, match="live validation target"):
+        v6_eval._read_prediction_cache(**kwargs, live_validation_targets=changed_values)
+
+    changed_indexes = {
+        group: target.set_axis(target.index.shift(1, freq="h"))
+        for group, target in live_targets.items()
+    }
+    with pytest.raises(ProvenanceError, match="live validation index"):
+        v6_eval._read_prediction_cache(
+            **kwargs, live_validation_targets=changed_indexes
+        )
+
+
+@pytest.mark.parametrize("corruption", ["json", "schema", "npz"])
+def test_prediction_cache_wraps_malformed_artifacts_as_provenance_error(
+    tmp_path, corruption
 ):
+    import v6_eval
+
+    fold = _synthetic_fold(pd.date_range("2023-01-01", periods=2, freq="h"))
+    manifest_path = write_prediction_cache(fold, tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    predictions_path = tmp_path / manifest["predictions_file"]
+    if corruption == "json":
+        manifest_path.write_text("{not-json", encoding="utf-8")
+    elif corruption == "schema":
+        manifest["schema_version"] = 999
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    else:
+        predictions_path.write_bytes(b"not-an-npz")
+
+    with pytest.raises(ProvenanceError, match="prediction cache"):
+        v6_eval._read_prediction_cache(
+            cache_dir=tmp_path,
+            recipe=fold.provenance.recipe,
+            train_years=fold.provenance.train_years,
+            valid_year=fold.provenance.valid_year,
+            groups=fold.provenance.groups,
+            seeds=fold.provenance.seeds,
+            recipe_fingerprint=fold.provenance.recipe_hash,
+            postprocess_config=fold.provenance.postprocess_config,
+            feature_fingerprint=fold.provenance.feature_hash,
+            data_hashes=fold.provenance.data_hashes,
+            derived_data_hashes=fold.provenance.derived_data_hashes,
+            row_counts=fold.provenance.row_counts,
+            live_validation_targets=fold.validation_targets,
+        )
+
+
+def test_scada_targets_always_build_from_raw(monkeypatch):
     import v6_eval
 
     labels = pd.DataFrame(
@@ -302,37 +491,140 @@ def test_scada_targets_build_from_raw_when_ignored_caches_are_absent(
         lambda frame: calls.append(("mismatch", frame)) or expected_mismatch,
     )
 
-    potential, mismatch = load_scada_targets(labels, cache_dir=tmp_path)
+    monkeypatch.setattr(
+        v6_eval.pd,
+        "read_parquet",
+        lambda *_args, **_kwargs: pytest.fail("stale parquet cache was consumed"),
+    )
+
+    potential, mismatch = load_scada_targets(labels)
 
     pd.testing.assert_frame_equal(potential, expected_potential)
     pd.testing.assert_frame_equal(mismatch, expected_mismatch)
     assert [name for name, _ in calls] == ["potential", "mismatch"]
 
 
-def test_baseline_guards_reject_row_or_anchor_drift():
-    assert_baseline_fingerprint("fold23", {
-        "g1_train": 6215,
-        "g2_train": 6174,
-        "g1_valid": 8757,
-        "g2_valid": 8758,
-    })
-    assert_score_anchor("fold23", 0.6316)
+def test_load_bundle_rebuilds_every_derived_frame_from_raw(monkeypatch):
+    import v6_eval
 
-    with pytest.raises(ProvenanceError, match="row fingerprint"):
-        assert_baseline_fingerprint("fold23", {
-            "g1_train": 6214,
+    index = pd.date_range("2023-01-01", periods=2, freq="h")
+    features = pd.DataFrame({"wind": [1.0, 2.0]}, index=index)
+    labels = pd.DataFrame(
+        {group: [3000.0, 4000.0] for group in v6_eval.GROUPS}, index=index
+    )
+    potential = pd.DataFrame(
+        {f"{group}_potential": [3100.0, 4100.0] for group in v6_eval.GROUPS},
+        index=index,
+    )
+    mismatch = pd.DataFrame(
+        {f"{group}_mismatch": [False, False] for group in v6_eval.GROUPS},
+        index=index,
+    )
+    calls = []
+    monkeypatch.setattr(v6_eval, "_BUNDLE", None)
+    monkeypatch.setattr(
+        v6_eval.pd,
+        "read_parquet",
+        lambda *_args, **_kwargs: pytest.fail("stale parquet cache was consumed"),
+    )
+    monkeypatch.setattr(v6_eval.pd, "read_csv", lambda *_args, **_kwargs: labels)
+    monkeypatch.setattr(
+        v6_eval,
+        "build_features",
+        lambda *paths: calls.append(("features", paths)) or features,
+    )
+    monkeypatch.setattr(
+        v6_eval,
+        "build_potential",
+        lambda frame: calls.append(("potential", frame)) or potential,
+    )
+    monkeypatch.setattr(
+        v6_eval,
+        "build_mismatch_mask",
+        lambda frame: calls.append(("mismatch", frame)) or mismatch,
+    )
+    monkeypatch.setattr(v6_eval, "_file_hash", lambda path: f"sha-{path.name}")
+
+    bundle = v6_eval.load_bundle()
+
+    pd.testing.assert_frame_equal(bundle.features, features)
+    pd.testing.assert_frame_equal(bundle.potential, potential)
+    pd.testing.assert_frame_equal(bundle.mismatch, mismatch)
+    assert [call[0] for call in calls] == ["features", "potential", "mismatch"]
+
+
+def test_baseline_guards_reject_row_or_anchor_drift():
+    assert_baseline_fingerprint(
+        "fold23",
+        {
+            "g1_train": 6215,
             "g2_train": 6174,
             "g1_valid": 8757,
             "g2_valid": 8758,
-        })
+        },
+    )
+    assert_score_anchor("fold23", 0.6316, seeds=(42,))
+
+    with pytest.raises(ProvenanceError, match="row fingerprint"):
+        assert_baseline_fingerprint(
+            "fold23",
+            {
+                "g1_train": 6214,
+                "g2_train": 6174,
+                "g1_valid": 8757,
+                "g2_valid": 8758,
+            },
+        )
     with pytest.raises(ProvenanceError, match="score anchor"):
-        assert_score_anchor("fold23", 0.6316 + 0.000151)
+        assert_score_anchor("fold23", 0.6316 + 0.000151, seeds=(42,))
+
+    assert_score_anchor("fold23", 0.0, seeds=(42, 202, 777))
+
+
+def test_score_fold_enforces_complete_fingerprint_for_baseline_recipe():
+    import v6_eval
+
+    fold = _synthetic_fold(
+        pd.date_range("2023-01-01", periods=2, freq="h"),
+        recipe=v6_eval.BASELINE_RECIPE,
+        recipe_config=deepcopy(v6_eval.BASELINE_RECIPE_CONFIG),
+        postprocess_config=deepcopy(v6_eval.BASELINE_POSTPROCESS_CONFIG),
+    )
+
+    with pytest.raises(ProvenanceError, match="row fingerprint"):
+        score_fold(fold)
+
+
+def test_stage7_nonbaseline_path_fails_before_baseline_ok(monkeypatch, capsys):
+    import v6_eval
+
+    monkeypatch.setattr(
+        v6_eval,
+        "fit_fold",
+        lambda *_args, **_kwargs: pytest.fail("baseline trained on nonbaseline path"),
+    )
+
+    assert v6_eval.run_stage7((42,), baseline_only=False) == 2
+    captured = capsys.readouterr()
+    assert "BASELINE_OK" not in captured.out
+
+
+def test_stage7_converts_provenance_failure_to_code_2(monkeypatch, capsys):
+    import v6_eval
+
+    def reject(*_args, **_kwargs):
+        raise ProvenanceError("prediction cache schema is malformed")
+
+    monkeypatch.setattr(v6_eval, "fit_fold", reject)
+
+    assert v6_eval.run_stage7((42,), baseline_only=True) == 2
+    captured = capsys.readouterr()
+    assert "BASELINE_OK" not in captured.out
+    assert "prediction cache schema" in captured.err
 
 
 def _stub_main_inputs(monkeypatch, exp_runner):
-    ldaps_raw = pd.DataFrame(
-        columns=["forecast_kst_dtm", "data_available_kst_dtm"]
-    )
+    ldaps_raw = pd.DataFrame(columns=["forecast_kst_dtm", "data_available_kst_dtm"])
     monkeypatch.setattr(exp_runner, "build_cache", lambda: None)
     monkeypatch.setattr(
         exp_runner,
@@ -399,9 +691,7 @@ def test_main_rejects_invalid_stage7_flags_without_training(monkeypatch, capsys)
         "run_stage7",
         lambda seeds, baseline_only=False: calls.append((seeds, baseline_only)) or 0,
     )
-    monkeypatch.setattr(
-        sys, "argv", ["exp_runner.py", "stage7", "--unknown-flag"]
-    )
+    monkeypatch.setattr(sys, "argv", ["exp_runner.py", "stage7", "--unknown-flag"])
 
     assert exp_runner.main() == 2
     assert calls == []
