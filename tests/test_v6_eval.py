@@ -13,10 +13,14 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
 from v6_eval import (
+    WEIGHTED_EXPECTED_ROWS,
+    WEIGHTED_RECIPE,
+    WEIGHTED_RECIPE_CONFIG,
     FoldPredictions,
     ProvenanceError,
     apply_floor10,
     assert_baseline_fingerprint,
+    assert_weighted_fingerprint,
     assert_fold_alignment,
     assert_score_anchor,
     blend_predictions,
@@ -247,6 +251,45 @@ def test_manifest_key_changes_with_seed_or_feature_name():
     assert len({original, changed_seed, changed_feature, changed_derived_target}) == 4
 
 
+@pytest.mark.parametrize(
+    "changed_hash",
+    [
+        "g1_calibration_index",
+        "g1_weights",
+        "weighted_targets_frame",
+        "g1_postfilter_train_index",
+        "g1_postfilter_train_target",
+    ],
+)
+def test_candidate_cache_identity_covers_every_weighted_training_input(changed_hash):
+    common = {
+        "recipe": WEIGHTED_RECIPE,
+        "recipe_hash": "recipe-sha",
+        "postprocess_hash": "post-sha",
+        "cache_schema_version": 2,
+        "train_years": (2022,),
+        "valid_year": 2023,
+        "groups": ("kpx_group_1", "kpx_group_2"),
+        "seeds": (42,),
+        "feature_hash": "feature-sha",
+        "data_hashes": {"labels": "label-sha", "scada": "scada-sha"},
+    }
+    evidence = {
+        "g1_calibration_index": "a",
+        "g1_weights": "b",
+        "weighted_targets_frame": "c",
+        "g1_postfilter_train_index": "d",
+        "g1_postfilter_train_target": "e",
+    }
+    changed = dict(evidence)
+    changed[changed_hash] += "-changed"
+
+    original_key = manifest_key(**common, derived_data_hashes=evidence)
+    changed_key = manifest_key(**common, derived_data_hashes=changed)
+
+    assert changed_key != original_key
+
+
 def test_recipe_fingerprint_covers_every_frozen_c1_behavior():
     import v6_eval
 
@@ -276,6 +319,30 @@ def test_recipe_fingerprint_covers_every_frozen_c1_behavior():
     hashes = {v6_eval.recipe_fingerprint(original)}
     hashes.update(v6_eval.recipe_fingerprint(variant) for variant in variants)
 
+    assert len(hashes) == 1 + len(variants)
+
+
+def test_weighted_recipe_fingerprint_covers_boundary_calibration_and_minimums():
+    import v6_eval
+
+    original = deepcopy(WEIGHTED_RECIPE_CONFIG)
+    variants = []
+    for path, value in (
+        (("training", "label_year_boundary"), "raw_timestamp_year"),
+        (("training", "calibration", "min_power"), 2.0),
+        (("training", "min_healthy", "kpx_group_1"), 2),
+    ):
+        changed = deepcopy(original)
+        cursor = changed
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        variants.append(changed)
+
+    hashes = {v6_eval.recipe_fingerprint(original)}
+    hashes.update(v6_eval.recipe_fingerprint(variant) for variant in variants)
+
+    assert WEIGHTED_RECIPE == "v6-weighted-potential-q60-filter05-floor10"
     assert len(hashes) == 1 + len(variants)
 
 
@@ -581,6 +648,15 @@ def test_baseline_guards_reject_row_or_anchor_drift():
     assert_score_anchor("fold23", 0.0, seeds=(42, 202, 777))
 
 
+def test_weighted_fingerprint_pins_candidate_training_rows():
+    assert_weighted_fingerprint("fold23", WEIGHTED_EXPECTED_ROWS["fold23"])
+
+    changed = dict(WEIGHTED_EXPECTED_ROWS["fold23"])
+    changed["g1_train"] -= 1
+    with pytest.raises(ProvenanceError, match="weighted row fingerprint"):
+        assert_weighted_fingerprint("fold23", changed)
+
+
 def test_score_fold_enforces_complete_fingerprint_for_baseline_recipe():
     import v6_eval
 
@@ -621,6 +697,69 @@ def test_stage7_converts_provenance_failure_to_code_2(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "BASELINE_OK" not in captured.out
     assert "prediction cache schema" in captured.err
+
+
+def test_stage7_weighted_screen_compares_aligned_baseline_and_candidate(
+    monkeypatch, capsys
+):
+    import v6_eval
+
+    calls = []
+
+    class StubFold:
+        def __init__(self, recipe, valid_year):
+            self.recipe = recipe
+            self.valid_year = valid_year
+            expected = (
+                v6_eval.EXPECTED_ROWS
+                if recipe == v6_eval.BASELINE_RECIPE
+                else v6_eval.WEIGHTED_EXPECTED_ROWS
+            )
+            self.provenance = type(
+                "StubProvenance",
+                (),
+                {
+                    "row_counts": expected[v6_eval._fold_name(valid_year)],
+                    "manifest_key": f"{recipe}-{valid_year}",
+                },
+            )()
+
+    def fit(recipe, train_years, valid_year, groups, seeds):
+        calls.append((recipe, train_years, valid_year, groups, seeds))
+        return StubFold(recipe, valid_year)
+
+    scores = {
+        (v6_eval.BASELINE_RECIPE, 2023): 0.631623985226,
+        (v6_eval.BASELINE_RECIPE, 2024): 0.638029787652,
+        (v6_eval.WEIGHTED_RECIPE, 2023): 0.633691786326,
+        (v6_eval.WEIGHTED_RECIPE, 2024): 0.639226950590,
+    }
+    alignments = []
+    monkeypatch.setattr(v6_eval, "fit_fold", fit)
+    monkeypatch.setattr(
+        v6_eval, "score_fold", lambda fold: scores[(fold.recipe, fold.valid_year)]
+    )
+    monkeypatch.setattr(
+        v6_eval,
+        "assert_fold_alignment",
+        lambda baseline, candidate: alignments.append((baseline, candidate)),
+    )
+    monkeypatch.setattr(v6_eval, "fold_metrics", lambda _fold: {"g": {}})
+
+    assert v6_eval.run_stage7((42,), screen="weighted") == 0
+    output = capsys.readouterr().out.strip().splitlines()
+    result = json.loads(output[-1])
+
+    assert [call[0] for call in calls] == [
+        v6_eval.BASELINE_RECIPE,
+        v6_eval.BASELINE_RECIPE,
+        v6_eval.WEIGHTED_RECIPE,
+        v6_eval.WEIGHTED_RECIPE,
+    ]
+    assert len(alignments) == 2
+    assert result["status"] == "PASS"
+    assert result["candidate_recipe"] == v6_eval.WEIGHTED_RECIPE
+    assert result["mean_delta"] == pytest.approx(0.001632482019)
 
 
 def _stub_main_inputs(monkeypatch, exp_runner):
@@ -679,6 +818,29 @@ def test_main_parses_stage7_seed_and_baseline_only_flags(monkeypatch):
 
     assert exp_runner.main() == 0
     assert calls == [((42,), True)]
+
+
+def test_main_parses_weighted_screen_without_legacy_bootstrap(monkeypatch):
+    import exp_runner
+
+    _forbid_legacy_bootstrap(monkeypatch, exp_runner)
+    calls = []
+    monkeypatch.setattr(
+        exp_runner,
+        "run_stage7",
+        lambda seeds, baseline_only=False, screen=None: calls.append(
+            (seeds, baseline_only, screen)
+        )
+        or 0,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["exp_runner.py", "stage7", "--seeds", "42", "--screen", "weighted"],
+    )
+
+    assert exp_runner.main() == 0
+    assert calls == [((42,), False, "weighted")]
 
 
 def test_main_rejects_invalid_stage7_flags_without_training(monkeypatch, capsys):

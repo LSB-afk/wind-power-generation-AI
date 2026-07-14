@@ -16,10 +16,16 @@ import pandas as pd
 from config import CAPACITY_KWH, GROUPS, ROOT, TRAIN_DIR
 from features import build_features
 from metrics import group_ficr, group_nmae
-from scada import build_mismatch_mask, build_potential
+from scada import (
+    WeightCalibration,
+    build_mismatch_mask,
+    build_potential,
+    build_weighted_targets,
+)
 
 
 BASELINE_RECIPE = "v5-c1-potential-q60-filter05-floor10"
+WEIGHTED_RECIPE = "v6-weighted-potential-q60-filter05-floor10"
 BASELINE_PARAMS = {
     "objective": "quantile",
     "alpha": 0.60,
@@ -40,6 +46,10 @@ EXPERIMENT_DIR = ROOT / ".omx" / "experiments" / "wind-v6"
 CACHE_SCHEMA_VERSION = 2
 ANCHOR_TOLERANCE = 0.00015
 BASELINE_ANCHORS = {"fold23": 0.6316, "fold24": 0.6380}
+WEIGHTED_ANCHORS = {
+    "fold23": 0.633691786326,
+    "fold24": 0.639226950590,
+}
 EXPECTED_ROWS = {
     "fold23": {
         "g1_train": 6215,
@@ -51,6 +61,22 @@ EXPECTED_ROWS = {
         "g1_train": 12516,
         "g2_train": 12455,
         "pooled_train": 30153,
+        "g1_valid": 8778,
+        "g2_valid": 8778,
+        "g3_valid": 8778,
+    },
+}
+WEIGHTED_EXPECTED_ROWS = {
+    "fold23": {
+        "g1_train": 6214,
+        "g2_train": 6176,
+        "g1_valid": 8757,
+        "g2_valid": 8758,
+    },
+    "fold24": {
+        "g1_train": 12516,
+        "g2_train": 12458,
+        "pooled_train": 30158,
         "g1_valid": 8778,
         "g2_valid": 8778,
         "g3_valid": 8778,
@@ -70,6 +96,50 @@ BASELINE_RECIPE_CONFIG = {
         "target": "scada_potential",
         "exclude_scada_mismatch": True,
         "filter_ratio": TRAIN_FILTER_RATIO,
+    },
+    "validation": {
+        "target": "raw_generation_label",
+        "fold_strategy": "calendar_year_holdout",
+    },
+    "model": {
+        "library": "lightgbm",
+        "params": dict(BASELINE_PARAMS),
+        "num_boost_round": 5000,
+        "early_stopping_rounds": 200,
+        "seed_aggregation": "arithmetic_mean",
+    },
+    "capacities": dict(CAPACITY_KWH),
+    "group_strategy": {
+        "version": 1,
+        "kpx_group_1": "solo_kwh",
+        "kpx_group_2": "solo_kwh",
+        "kpx_group_3": "pooled_normalized_with_group_id",
+    },
+    "postprocess": dict(BASELINE_POSTPROCESS_CONFIG),
+}
+WEIGHTED_RECIPE_CONFIG = {
+    "version": 1,
+    "name": WEIGHTED_RECIPE,
+    "training": {
+        "target": "fold_safe_turbine_weighted_scada_potential",
+        "exclude_scada_mismatch": True,
+        "filter_ratio": TRAIN_FILTER_RATIO,
+        "label_year_boundary": "raw_scada_timestamp.ceil('h')",
+        "calibration": {
+            "complete_power_and_wind": True,
+            "min_power": 1.0,
+            "min_wind_speed": 5.0,
+            "min_group_output_capacity_ratio_per_interval": 0.10 / 6.0,
+            "estimator": "n_times_median_turbine_share_then_mean_one",
+        },
+        "healthy": "power_gt_1_or_wind_lt_5",
+        "min_healthy": {
+            "kpx_group_1": 3,
+            "kpx_group_2": 3,
+            "kpx_group_3": 2,
+        },
+        "clip_each_10m": True,
+        "hourly_aggregation": "mean_times_6",
     },
     "validation": {
         "target": "raw_generation_label",
@@ -551,25 +621,34 @@ def load_bundle() -> TrainingBundle:
 
 
 def _solo_train_frame(
-    bundle: TrainingBundle, group: str, train_years: tuple[int, ...]
+    bundle: TrainingBundle,
+    group: str,
+    train_years: tuple[int, ...],
+    targets: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     capacity = CAPACITY_KWH[group]
     frame = bundle.data.dropna(subset=[group])
     train = frame[frame.index.year.isin(train_years)].copy()
-    train["_target"] = bundle.potential[f"{group}_potential"].reindex(train.index)
+    target_frame = bundle.potential if targets is None else targets
+    suffix = "potential" if targets is None else "weighted_potential"
+    train["_target"] = target_frame[f"{group}_{suffix}"].reindex(train.index)
     mismatch = bundle.mismatch[f"{group}_mismatch"].reindex(train.index).fillna(False)
     train = train[~mismatch].dropna(subset=["_target"])
     return train[train["_target"] >= TRAIN_FILTER_RATIO * capacity]
 
 
 def _pooled_train_frame(
-    bundle: TrainingBundle, train_years: tuple[int, ...]
+    bundle: TrainingBundle,
+    train_years: tuple[int, ...],
+    targets: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
     frames = []
     columns = bundle.feature_columns
+    target_frame = bundle.potential if targets is None else targets
+    suffix = "potential" if targets is None else "weighted_potential"
     for group in GROUPS:
         frame = bundle.data.dropna(subset=[group]).copy()
-        frame["_target"] = bundle.potential[f"{group}_potential"].reindex(frame.index)
+        frame["_target"] = target_frame[f"{group}_{suffix}"].reindex(frame.index)
         mismatch = (
             bundle.mismatch[f"{group}_mismatch"].reindex(frame.index).fillna(False)
         )
@@ -630,6 +709,16 @@ def assert_baseline_fingerprint(fold_name: str, row_counts: Mapping[str, int]) -
         )
 
 
+def assert_weighted_fingerprint(fold_name: str, row_counts: Mapping[str, int]) -> None:
+    expected = WEIGHTED_EXPECTED_ROWS.get(fold_name)
+    actual = {key: int(value) for key, value in row_counts.items()}
+    if expected is None or actual != expected:
+        raise ProvenanceError(
+            f"{fold_name} weighted row fingerprint drift: expected {expected}, "
+            f"got {actual}"
+        )
+
+
 def assert_score_anchor(
     fold_name: str, score: float, *, seeds: tuple[int, ...]
 ) -> None:
@@ -645,6 +734,51 @@ def assert_score_anchor(
             f"{fold_name} score anchor drift: expected {expected} +/- "
             f"{ANCHOR_TOLERANCE}, got {score}"
         )
+
+
+def assert_weighted_score_anchor(
+    fold_name: str, score: float, *, seeds: tuple[int, ...]
+) -> None:
+    if tuple(int(seed) for seed in seeds) != (42,):
+        return
+    expected = WEIGHTED_ANCHORS.get(fold_name)
+    if expected is None or not np.isfinite(score) or abs(score - expected) > 1e-6:
+        raise ProvenanceError(
+            f"{fold_name} weighted score anchor drift: expected {expected} +/- "
+            f"1e-06, got {score}"
+        )
+
+
+def _weighted_derived_hashes(
+    bundle: TrainingBundle,
+    weighted_targets: pd.DataFrame,
+    calibrations: Mapping[str, WeightCalibration],
+    solo_frames: Mapping[str, pd.DataFrame],
+    pooled_frame: pd.DataFrame | None,
+) -> dict[str, str]:
+    """Hash every candidate-specific input after fold-safe target construction."""
+    hashes = {
+        "mismatch_frame": bundle.derived_data_hashes["mismatch_frame"],
+        "weighted_targets_frame": _pandas_hash(weighted_targets),
+    }
+    for group, calibration in calibrations.items():
+        prefix = f"g{group[-1]}"
+        hashes[f"{prefix}_calibration_metadata"] = _canonical_hash(asdict(calibration))
+        hashes[f"{prefix}_calibration_index"] = calibration.calibration_index_hash
+        hashes[f"{prefix}_weights"] = calibration.weights_hash
+        hashes[f"{prefix}_weighted_target"] = _pandas_hash(
+            weighted_targets[f"{group}_weighted_potential"]
+        )
+    for group, train in solo_frames.items():
+        prefix = f"g{group[-1]}"
+        hashes[f"{prefix}_postfilter_train_index"] = _pandas_hash(train.index)
+        hashes[f"{prefix}_postfilter_train_target"] = _pandas_hash(train["_target"])
+    if pooled_frame is not None:
+        hashes["pooled_postfilter_train_index"] = _pandas_hash(pooled_frame.index)
+        hashes["pooled_postfilter_train_target"] = _pandas_hash(
+            pooled_frame[["normalized_target", "group_id"]]
+        )
+    return dict(sorted(hashes.items()))
 
 
 def _cache_paths(cache_dir: Path, key: str) -> tuple[Path, Path]:
@@ -865,11 +999,11 @@ def fit_fold(
     groups: tuple[str, ...],
     seeds: tuple[int, ...],
 ) -> FoldPredictions:
-    """Fit or load one exact frozen-v5 validation fold."""
+    """Fit or load one exact baseline or weighted-candidate validation fold."""
     train_years = tuple(train_years)
     groups = tuple(groups)
     seeds = tuple(int(seed) for seed in seeds)
-    if recipe != BASELINE_RECIPE:
+    if recipe not in {BASELINE_RECIPE, WEIGHTED_RECIPE}:
         raise ValueError(f"unsupported recipe: {recipe}")
     if not seeds:
         raise ValueError("at least one seed is required")
@@ -879,10 +1013,19 @@ def fit_fold(
     }
     if (train_years, valid_year, groups) not in expected_fold:
         raise ValueError(
-            "baseline evaluator supports only the frozen fold23/fold24 splits"
+            "stage7 evaluator supports only the frozen fold23/fold24 splits"
         )
 
     bundle = load_bundle()
+    weighted_targets: pd.DataFrame | None = None
+    calibrations: dict[str, WeightCalibration] = {}
+    if recipe == WEIGHTED_RECIPE:
+        weighted_targets, calibrations = build_weighted_targets(
+            bundle.labels.index,
+            train_label_years=train_years,
+            target_label_years=train_years,
+            groups=groups,
+        )
     row_counts: dict[str, int] = {}
     solo_frames: dict[str, pd.DataFrame] = {}
     validation_frames: dict[str, pd.DataFrame] = {}
@@ -892,21 +1035,40 @@ def fit_fold(
         validation_frames[group] = validation
         row_counts[f"g{group[-1]}_valid"] = len(validation)
         if group in G12:
-            solo_frames[group] = _solo_train_frame(bundle, group, train_years)
+            solo_frames[group] = _solo_train_frame(
+                bundle, group, train_years, weighted_targets
+            )
             row_counts[f"g{group[-1]}_train"] = len(solo_frames[group])
 
     pooled_frame: pd.DataFrame | None = None
     pooled_columns: tuple[str, ...] = ()
     if G3 in groups:
-        pooled_frame, pooled_columns = _pooled_train_frame(bundle, train_years)
+        pooled_frame, pooled_columns = _pooled_train_frame(
+            bundle, train_years, weighted_targets
+        )
         row_counts["pooled_train"] = len(pooled_frame)
     row_counts = dict(sorted(row_counts.items()))
     fold_name = _fold_name(valid_year)
-    assert_baseline_fingerprint(fold_name, row_counts)
+    if recipe == BASELINE_RECIPE:
+        assert_baseline_fingerprint(fold_name, row_counts)
+        recipe_config = BASELINE_RECIPE_CONFIG
+        derived_data_hashes = bundle.derived_data_hashes
+    else:
+        assert_weighted_fingerprint(fold_name, row_counts)
+        if weighted_targets is None:
+            raise ProvenanceError("weighted targets are missing")
+        recipe_config = WEIGHTED_RECIPE_CONFIG
+        derived_data_hashes = _weighted_derived_hashes(
+            bundle,
+            weighted_targets,
+            calibrations,
+            solo_frames,
+            pooled_frame,
+        )
     validation_targets = {
         group: validation_frames[group][group].copy().rename(group) for group in groups
     }
-    baseline_recipe_hash = recipe_fingerprint(BASELINE_RECIPE_CONFIG)
+    current_recipe_hash = recipe_fingerprint(recipe_config)
 
     cached = _read_prediction_cache(
         cache_dir=EXPERIMENT_DIR,
@@ -915,11 +1077,11 @@ def fit_fold(
         valid_year=valid_year,
         groups=groups,
         seeds=seeds,
-        recipe_fingerprint=baseline_recipe_hash,
+        recipe_fingerprint=current_recipe_hash,
         postprocess_config=BASELINE_POSTPROCESS_CONFIG,
         feature_fingerprint=bundle.feature_hash,
         data_hashes=bundle.data_hashes,
-        derived_data_hashes=bundle.derived_data_hashes,
+        derived_data_hashes=derived_data_hashes,
         row_counts=row_counts,
         live_validation_targets=validation_targets,
     )
@@ -968,11 +1130,11 @@ def fit_fold(
         valid_year=valid_year,
         groups=groups,
         seeds=seeds,
-        recipe_config=BASELINE_RECIPE_CONFIG,
+        recipe_config=recipe_config,
         postprocess_config=BASELINE_POSTPROCESS_CONFIG,
         feature_hash=bundle.feature_hash,
         data_hashes=bundle.data_hashes,
-        derived_data_hashes=bundle.derived_data_hashes,
+        derived_data_hashes=derived_data_hashes,
         row_counts=row_counts,
         model_predictions=model_predictions,
         validation_targets=validation_targets,
@@ -984,8 +1146,8 @@ def fit_fold(
         expected_seeds=seeds,
         expected_feature_hash=bundle.feature_hash,
         expected_data_hashes=bundle.data_hashes,
-        expected_derived_data_hashes=bundle.derived_data_hashes,
-        expected_recipe_hash=baseline_recipe_hash,
+        expected_derived_data_hashes=derived_data_hashes,
+        expected_recipe_hash=current_recipe_hash,
         expected_postprocess_hash=recipe_fingerprint(BASELINE_POSTPROCESS_CONFIG),
     )
     write_prediction_cache(fold)
@@ -1010,28 +1172,62 @@ def score_fold(predictions: FoldPredictions) -> float:
         assert_baseline_fingerprint(
             _fold_name(provenance.valid_year), provenance.row_counts
         )
-    nmaes = []
-    ficrs = []
-    for group in predictions.provenance.groups:
-        model_prediction = predictions.model_predictions[group].to_numpy()
-        validation_target = predictions.validation_targets[group].to_numpy()
-        capacity = CAPACITY_KWH[group]
-        nmaes.append(group_nmae(model_prediction, validation_target, capacity))
-        ficrs.append(group_ficr(model_prediction, validation_target, capacity))
+    elif provenance.recipe == WEIGHTED_RECIPE:
+        if provenance.recipe_config != _json_object(
+            WEIGHTED_RECIPE_CONFIG, "weighted recipe config"
+        ) or provenance.recipe_hash != recipe_fingerprint(WEIGHTED_RECIPE_CONFIG):
+            raise ProvenanceError("weighted recipe config drift")
+        if provenance.postprocess_config != _json_object(
+            BASELINE_POSTPROCESS_CONFIG, "weighted postprocess config"
+        ) or provenance.postprocess_hash != recipe_fingerprint(
+            BASELINE_POSTPROCESS_CONFIG
+        ):
+            raise ProvenanceError("weighted postprocess config drift")
+        assert_weighted_fingerprint(
+            _fold_name(provenance.valid_year), provenance.row_counts
+        )
+    metrics = fold_metrics(predictions)
+    nmaes = [values["nmae"] for values in metrics.values()]
+    ficrs = [values["ficr"] for values in metrics.values()]
     score = 0.5 * (1.0 - float(np.mean(nmaes))) + 0.5 * float(np.mean(ficrs))
     if not np.isfinite(score):
         raise ProvenanceError("fold score is not finite")
     return score
 
 
-def run_stage7(seeds: tuple[int, ...], baseline_only: bool = False) -> int:
-    """Reproduce the frozen baseline; remain fail-closed until a candidate exists."""
+def fold_metrics(predictions: FoldPredictions) -> dict[str, dict[str, float]]:
+    """Return per-group components from hash-verified live validation targets."""
+    validate_fold_predictions(predictions)
+    metrics: dict[str, dict[str, float]] = {}
+    for group in predictions.provenance.groups:
+        model_prediction = predictions.model_predictions[group].to_numpy()
+        validation_target = predictions.validation_targets[group].to_numpy()
+        capacity = CAPACITY_KWH[group]
+        nmae = float(group_nmae(model_prediction, validation_target, capacity))
+        ficr = float(group_ficr(model_prediction, validation_target, capacity))
+        score = 0.5 * (1.0 - nmae) + 0.5 * ficr
+        if not np.isfinite([nmae, ficr, score]).all():
+            raise ProvenanceError(f"{group} metrics are not finite")
+        metrics[group] = {"nmae": nmae, "ficr": ficr, "score": score}
+    return metrics
+
+
+def run_stage7(
+    seeds: tuple[int, ...], baseline_only: bool = False, screen: str | None = None
+) -> int:
+    """Reproduce v5 or compare the fold-safe weighted candidate under one gate."""
     seeds = tuple(int(seed) for seed in seeds)
-    if not baseline_only:
+    if baseline_only and screen is not None:
+        print("--baseline-only cannot be combined with --screen", file=sys.stderr)
+        return 2
+    if not baseline_only and screen is None:
         print(
-            "stage7 candidate evaluation is not implemented yet; use --baseline-only",
+            "stage7 requires --baseline-only or --screen weighted",
             file=sys.stderr,
         )
+        return 2
+    if screen not in {None, "weighted"}:
+        print(f"unsupported stage7 screen: {screen}", file=sys.stderr)
         return 2
     try:
         fold23 = fit_fold(BASELINE_RECIPE, (2022,), 2023, G12, seeds)
@@ -1042,17 +1238,63 @@ def run_stage7(seeds: tuple[int, ...], baseline_only: bool = False) -> int:
         for fold_name, score in scores.items():
             assert_score_anchor(fold_name, score, seeds=seeds)
             print(f"[{fold_name}] frozen v5 C1 score={score:.6f}")
+        if baseline_only:
+            result = {
+                "status": "BASELINE_OK",
+                "recipe": BASELINE_RECIPE,
+                "seeds": list(seeds),
+                "scores": scores,
+                "manifest_keys": {
+                    "fold23": fold23.provenance.manifest_key,
+                    "fold24": fold24.provenance.manifest_key,
+                },
+            }
+            print(json.dumps(result, sort_keys=True))
+            return 0
+
+        candidate23 = fit_fold(WEIGHTED_RECIPE, (2022,), 2023, G12, seeds)
+        candidate24 = fit_fold(
+            WEIGHTED_RECIPE, (2022, 2023), 2024, tuple(GROUPS), seeds
+        )
+        assert_weighted_fingerprint("fold23", candidate23.provenance.row_counts)
+        assert_weighted_fingerprint("fold24", candidate24.provenance.row_counts)
+        assert_fold_alignment(fold23, candidate23)
+        assert_fold_alignment(fold24, candidate24)
+        candidates = {
+            "fold23": score_fold(candidate23),
+            "fold24": score_fold(candidate24),
+        }
+        for fold_name, score in candidates.items():
+            assert_weighted_score_anchor(fold_name, score, seeds=seeds)
+            print(f"[{fold_name}] weighted v6 score={score:.6f}")
+        gate = gate_scores(scores, candidates)
         result = {
-            "status": "BASELINE_OK",
-            "recipe": BASELINE_RECIPE,
+            **gate,
+            "candidate_recipe": WEIGHTED_RECIPE,
             "seeds": list(seeds),
-            "scores": scores,
+            "metrics": {
+                "baseline": {
+                    "fold23": fold_metrics(fold23),
+                    "fold24": fold_metrics(fold24),
+                },
+                "candidate": {
+                    "fold23": fold_metrics(candidate23),
+                    "fold24": fold_metrics(candidate24),
+                },
+            },
             "manifest_keys": {
-                "fold23": fold23.provenance.manifest_key,
-                "fold24": fold24.provenance.manifest_key,
+                "baseline": {
+                    "fold23": fold23.provenance.manifest_key,
+                    "fold24": fold24.provenance.manifest_key,
+                },
+                "candidate": {
+                    "fold23": candidate23.provenance.manifest_key,
+                    "fold24": candidate24.provenance.manifest_key,
+                },
             },
         }
         print(json.dumps(result, sort_keys=True))
+        return 0 if gate["status"] == "PASS" else 1
     except (
         ProvenanceError,
         ValueError,
@@ -1060,7 +1302,6 @@ def run_stage7(seeds: tuple[int, ...], baseline_only: bool = False) -> int:
         KeyError,
         json.JSONDecodeError,
     ) as error:
-        print(f"stage7 baseline rejected: {error}", file=sys.stderr)
+        scope = "baseline" if baseline_only else "weighted candidate"
+        print(f"stage7 {scope} rejected: {error}", file=sys.stderr)
         return 2
-
-    return 0

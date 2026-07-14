@@ -675,6 +675,7 @@ def main():
     if mode == "stage7":
         seeds = SEEDS3
         baseline_only = False
+        screen = None
         args = sys.argv[2:]
         position = 0
         while position < len(args):
@@ -701,9 +702,19 @@ def main():
                     )
                     return 2
                 continue
+            if argument == "--screen":
+                position += 1
+                if position >= len(args) or args[position].startswith("--"):
+                    print("--screen requires one value", file=sys.stderr)
+                    return 2
+                screen = args[position]
+                position += 1
+                continue
             print(f"unknown stage7 argument: {argument}", file=sys.stderr)
             return 2
-        return run_stage7(seeds, baseline_only=baseline_only)
+        if screen is None:
+            return run_stage7(seeds, baseline_only=baseline_only)
+        return run_stage7(seeds, baseline_only=baseline_only, screen=screen)
     if mode not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6"}:
         print(f"unknown mode: {mode}", file=sys.stderr)
         return 2
@@ -711,7 +722,8 @@ def main():
     build_cache()
     base_feat, ldaps_raw, gfs_raw, labels = load_cache()
     davail = ldaps_raw.drop_duplicates("forecast_kst_dtm").set_index(
-        "forecast_kst_dtm")["data_available_kst_dtm"]
+        "forecast_kst_dtm"
+    )["data_available_kst_dtm"]
 
     feat_ctx = add_context(base_feat, davail)
 
