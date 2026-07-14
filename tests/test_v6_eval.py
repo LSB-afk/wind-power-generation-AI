@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -23,6 +24,26 @@ def test_gate_requires_both_folds_and_mean_gain():
         {"fold23": 0.6299, "fold24": 0.65},
     )
     assert failed["status"] == "FAIL"
+
+
+def test_gate_rejects_two_positive_deltas_below_mean_threshold():
+    result = gate_scores(
+        {"fold23": 0.0, "fold24": 0.0},
+        {"fold23": 0.0009, "fold24": 0.0009},
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["mean_delta"] == pytest.approx(0.0009)
+
+
+def test_gate_accepts_exact_mean_threshold():
+    result = gate_scores(
+        {"fold23": 0.0, "fold24": 0.0},
+        {"fold23": 0.001, "fold24": 0.001},
+    )
+
+    assert result["status"] == "PASS"
+    assert result["mean_delta"] == pytest.approx(0.001)
 
 
 def test_blend_predictions_uses_actual_family_weight():
@@ -51,10 +72,21 @@ def _stub_main_inputs(monkeypatch, exp_runner):
     monkeypatch.setattr(exp_runner, "add_context", lambda feat, _davail: feat)
 
 
+def _forbid_legacy_bootstrap(monkeypatch, exp_runner):
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            pytest.fail(f"legacy bootstrap called: {name}")
+
+        return fail
+
+    for name in ("build_cache", "load_cache", "add_context"):
+        monkeypatch.setattr(exp_runner, name, forbidden(name))
+
+
 def test_main_routes_literal_stage7_and_propagates_result(monkeypatch):
     import exp_runner
 
-    _stub_main_inputs(monkeypatch, exp_runner)
+    _forbid_legacy_bootstrap(monkeypatch, exp_runner)
     calls = []
     monkeypatch.setattr(
         exp_runner, "run_stage7", lambda seeds: calls.append(seeds) or 17
@@ -62,7 +94,7 @@ def test_main_routes_literal_stage7_and_propagates_result(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["exp_runner.py", "stage7"])
 
     assert exp_runner.main() == 17
-    assert calls == [exp_runner.SEEDS3]
+    assert calls == [(42, 202, 777)]
 
 
 def test_main_routes_literal_stage6(monkeypatch):
@@ -81,7 +113,7 @@ def test_main_routes_literal_stage6(monkeypatch):
 def test_main_rejects_unknown_mode_without_stage_fallback(monkeypatch, capsys):
     import exp_runner
 
-    _stub_main_inputs(monkeypatch, exp_runner)
+    _forbid_legacy_bootstrap(monkeypatch, exp_runner)
     stage6_calls = []
     stage7_calls = []
     monkeypatch.setattr(exp_runner, "stage6", stage6_calls.append)

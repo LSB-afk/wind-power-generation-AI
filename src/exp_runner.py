@@ -671,6 +671,13 @@ def stage4(data, cols):
 
 
 def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "stage3"
+    if mode == "stage7":
+        return run_stage7(SEEDS3)
+    if mode not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6"}:
+        print(f"unknown mode: {mode}", file=sys.stderr)
+        return 2
+
     build_cache()
     base_feat, ldaps_raw, gfs_raw, labels = load_cache()
     davail = ldaps_raw.drop_duplicates("forecast_kst_dtm").set_index(
@@ -681,7 +688,6 @@ def main():
     def dataset(feat):
         return feat.join(labels, how="inner"), list(feat.columns)
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else "stage3"
     if mode == "stage1":
         feat_full = add_idw(feat_ctx, ldaps_raw, gfs_raw)
         stage1({"E0_base": dataset(base_feat), "E1_ctx": dataset(feat_ctx),
@@ -699,11 +705,6 @@ def main():
         stage5({"base": dataset(base_feat), "ctx": dataset(feat_ctx)})
     elif mode == "stage6":
         stage6({"ctx": dataset(feat_ctx)})
-    elif mode == "stage7":
-        return run_stage7(SEEDS3)
-    else:
-        print(f"unknown mode: {mode}", file=sys.stderr)
-        return 2
 
 
 if __name__ == "__main__":
