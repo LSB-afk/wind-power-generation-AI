@@ -673,7 +673,37 @@ def stage4(data, cols):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "stage3"
     if mode == "stage7":
-        return run_stage7(SEEDS3)
+        seeds = SEEDS3
+        baseline_only = False
+        args = sys.argv[2:]
+        position = 0
+        while position < len(args):
+            argument = args[position]
+            if argument == "--baseline-only":
+                baseline_only = True
+                position += 1
+                continue
+            if argument == "--seeds":
+                position += 1
+                seed_values = []
+                while position < len(args) and not args[position].startswith("--"):
+                    seed_values.append(args[position])
+                    position += 1
+                if not seed_values:
+                    print("--seeds requires at least one integer", file=sys.stderr)
+                    return 2
+                try:
+                    seeds = tuple(int(value) for value in seed_values)
+                except ValueError:
+                    print(
+                        f"invalid --seeds value: {' '.join(seed_values)}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                continue
+            print(f"unknown stage7 argument: {argument}", file=sys.stderr)
+            return 2
+        return run_stage7(seeds, baseline_only=baseline_only)
     if mode not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6"}:
         print(f"unknown mode: {mode}", file=sys.stderr)
         return 2
