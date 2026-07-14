@@ -29,44 +29,51 @@ combination (potential-target solo models for groups 1/2 and a potential-target 
 group 3) is absent from the stage output. `stage7` will therefore freeze and evaluate this exact
 recipe before testing any v6 candidate.
 
-## Candidate sequence
+## Candidate decision
 
-### 1. Cross-target ensemble (recommended first)
+### Selected candidate: fold-safe turbine-weighted potential
 
-Train two leakage-safe model families on each fold:
+A bounded seed-42 probe showed that the equal-turbine assumption in the v5 SCADA potential is
+the most promising remaining bias. When a healthy turbine's output is approximately
+`p_i = c * w_i`, the all-turbine potential is reconstructed as:
 
-- actual-label family: the public-proven v4 cleaning recipe;
-- potential-label family: the current v5 recipe.
+```text
+sum(p_i for healthy i) * sum(w_i for all i) / sum(w_i for healthy i)
+```
 
-Search a small, fixed blend grid and accept only weights that improve both folds. This combines
-the public robustness of actual-label learning with the fold23 gain of potential reconstruction,
-without adding a dependency or relying on year-specific scale/floor tuning.
+The weights are robust per-turbine output shares learned only from the training label-years.
+Equal weights reduce exactly to v5, and an all-healthy row reduces to the observed group total.
+The corrected leakage-safe probe produced:
 
-### 2. Physical feature pack
+- fold23 `0.633691786326`, delta `+0.002067801100`;
+- fold24 `0.639226950590`, delta `+0.001197162938`;
+- mean delta `+0.001632482019`, satisfying the one-seed gate.
 
-If blending alone does not pass, add a compact pack shared by training and inference:
+Calendar membership is defined by `hour_end = raw_scada_timestamp.ceil("h")`, never by the raw
+10-minute timestamp's year. This excludes the five `12/31 23:10`-`23:50` rows whose hourly label
+belongs to the following validation year. The legacy healthy-count thresholds remain exactly
+`3/3/2` for groups 1/2/3.
 
-- density-adjusted hub-height wind power proxies;
-- 80-100 m and 10-100 m shear ratios/exponents;
-- gust factors and directional wind components weighted by speed;
-- within-forecast-block ramps for the most relevant hub-height variables.
+The weights, ordered turbine columns, calibration row/index hashes, weighted target hashes, and
+post-filter training row/target hashes become candidate provenance. Evaluation and production
+must import the same target builder.
 
-Each feature must be derivable from the supplied forecast at prediction time. The full pack is
-accepted only when its combined recipe improves both folds; individual feature fishing is
-avoided.
+### Rejected or deferred probes
 
-### 3. Metric-aligned alternative
-
-Only if the first two approaches fail, compare a bounded set of LightGBM objectives or
-sample-weight rules that approximate the FICR tolerance bands. No post-hoc parameter may be
-chosen from fold24 alone. A setting must win on both folds and then be confirmed with the
-three-seed ensemble.
+- Adding temporal context for `ldaps_g13_ws10` improved both folds but only by a mean
+  `+0.000494403`, below the contract.
+- Combining that context with the weighted target weakened fold24 to only `+0.000138713`; the
+  extra feature complexity is rejected.
+- Cross-target blending, the broader physical pack, and metric-weight search are now contingency
+  paths only if the selected recipe fails the three-seed gate. Continuing to search after a
+  physically grounded both-fold winner would add selection risk without evidence of need.
 
 ## Evaluator and data flow
 
 `python src/exp_runner.py stage7` will:
 
-1. load the existing cached forecast features and SCADA-derived training targets;
+1. rebuild forecast features and SCADA-derived targets from the current raw competition files,
+   using only hash-verified prediction caches;
 2. construct the exact v5 baseline and the selected v6 candidate with identical folds/seeds;
 3. apply only the mathematically safe `0.10 * capacity` floor;
 4. print per-fold, per-group, NMAE, FICR, score, deltas, and a final PASS/FAIL result;

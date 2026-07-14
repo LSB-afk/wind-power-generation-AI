@@ -133,139 +133,119 @@ Expected: tests pass; stage7 reports anchors within tolerance and writes a cache
 
 Record a performance-goal checkpoint with the baseline scores and commit the frozen evaluator with the exact commands in `Tested:`.
 
-### Task 3: Cross-target ensemble screening
+### Task 3: Fold-safe turbine-weighted potential candidate
 
 **Files:**
+- Modify: `src/scada.py`
 - Modify: `src/v6_eval.py`
+- Modify: `src/exp_runner.py`
+- Create: `tests/test_scada.py`
 - Modify: `tests/test_v6_eval.py`
 - Modify: `docs/experiments.md`
 
 **Interfaces:**
-- Produces: actual-label v4 family predictions using bad-mask exclusion, q60/filter05, solo groups 1/2, pooled group 3, and floor10.
-- Produces: `screen_blend_weights(...) -> list[dict]` over weights `{0.25, 0.50, 0.75}`.
+- Produces: immutable `WeightCalibration` metadata with train label-years, ordered turbine
+  columns, weights, calibration row count, calibration-index hash, and weights hash.
+- Produces: `estimate_turbine_weights(...)`, `reconstruct_weighted_potential(...)`, and
+  `build_weighted_targets(...)` from `src/scada.py`; evaluation and production must share them.
+- Produces: candidate recipe `v6-weighted-potential-q60-filter05-floor10` in `src/v6_eval.py`.
+- Produces: `stage7 --seeds 42 --screen weighted` with baseline/candidate scores, deltas, and
+  machine-readable gate output.
 
-- [ ] **Step 1: Write failing tests for group-wise blend-grid ranking**
+- [ ] **Step 1: Write failing reconstruction and calendar-boundary tests**
 
-Use fixed synthetic baseline/alternative predictions and actuals to prove that ranking is deterministic and never reads validation targets while constructing predictions.
+Cover equal-weight parity with v5, all-healthy identity, a proportional-output example, missing
+high/low-weight turbines, deterministic normalized weights, sentinel/NaN handling, unsorted input,
+column ordering, exact-hour timestamps, and finite division behavior. Pin calendar membership to
+`hour_end = timestamp.ceil("h")`, including `12/31 23:50`, so validation-year SCADA cannot affect
+calibration or training targets. Pin minimum healthy turbines to `3/3/2`.
 
-- [ ] **Step 2: Run tests and verify failure**
+- [ ] **Step 2: Run RED tests**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_v6_eval.py -k blend`
+Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_scada.py tests/test_v6_eval.py`
 
-Expected: `screen_blend_weights` is missing.
+Expected: missing weighted-target interfaces and candidate recipe fail before production edits.
 
-- [ ] **Step 3: Implement actual-label family and bounded grid**
+- [ ] **Step 3: Implement one shared weighted-target builder**
 
-Train/cache actual-label OOF predictions on the exact baseline folds. Evaluate global actual-family weights `0.25`, `0.50`, and `0.75`; select the highest mean score among candidates with positive deltas on both folds. Do not search scale or floor.
+Use calibration rows from training label-years only. Require every turbine's sanitized power and
+wind speed to be present, every power `> 1`, every wind speed `>= 5`, and group output at least
+`0.10 * capacity / 6`. Estimate robust shares with
+`n * median(turbine_power / group_power)`, then renormalize to mean one. Reconstruct with weighted
+healthy-turbine coverage, clip each 10-minute value before hourly aggregation, and return NaN
+outside requested target label-years. Accept label indexes, never actual label values.
 
-- [ ] **Step 4: Run one-seed screening**
+- [ ] **Step 4: Integrate candidate provenance and cache safety**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 python src/exp_runner.py stage7 --seeds 42 --screen blend`
+Hash calibration indexes/weights, weighted targets, post-filter training indexes/targets, and
+candidate row counts. Keep raw-source hashes and actual validation targets identical to baseline;
+allow candidate derived-target hashes and training counts to differ. Fold23 must never calibrate
+group 3. Pin these expected rows:
 
-Expected: a table with baseline, each weight, fold deltas, and a selected or rejected result.
+```python
+WEIGHTED_EXPECTED_ROWS = {
+    "fold23": {"g1_train": 6214, "g2_train": 6176,
+               "g1_valid": 8757, "g2_valid": 8758},
+    "fold24": {"g1_train": 12516, "g2_train": 12458, "pooled_train": 30158,
+               "g1_valid": 8778, "g2_valid": 8778, "g3_valid": 8778},
+}
+```
 
-- [ ] **Step 5: Record evidence**
+- [ ] **Step 5: Reproduce the corrected one-seed gate**
 
-Append every screened score to `docs/experiments.md`; checkpoint failures as `fail`, not `pass`. Commit only if the harness behavior changed or a recipe is selected.
+Run: `PYTHONDONTWRITEBYTECODE=1 python src/exp_runner.py stage7 --seeds 42 --screen weighted`
 
-### Task 4: Physical feature-pack candidate if blending is insufficient
+Expected (within deterministic tolerance): fold23 `0.633691786326`, fold24 `0.639226950590`, both
+deltas positive, mean delta `0.001632482019`, final status `PASS`.
 
-**Files:**
-- Modify: `src/features.py`
-- Modify: `src/v6_eval.py`
-- Create: `tests/test_features.py`
-- Modify: `docs/experiments.md`
+- [ ] **Step 6: Record, review, and commit**
 
-**Interfaces:**
-- Produces: `add_physical_features(feat: pd.DataFrame) -> pd.DataFrame`
-- Adds stable columns `phys_ws100_density_power`, `phys_ws80_density_power`, `phys_shear_100_80`, `phys_shear_100_10`, `phys_gust_factor`, `phys_ws100_u`, and `phys_ws100_v` when source columns are present.
+Append the candidate, rejected g13 variants, formula, boundary correction, and exact evidence to
+`docs/experiments.md`. Run project tests/static checks, obtain an independent code review, then
+commit with Lore trailers.
 
-- [ ] **Step 1: Write failing deterministic feature tests**
-
-Construct a two-row frame with known wind speed, density, direction sine/cosine, gust, and shear inputs. Assert exact formulas, finite outputs, unchanged index, and identical train/test column order.
-
-- [ ] **Step 2: Run tests and verify failure**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_features.py`
-
-Expected: `add_physical_features` is missing.
-
-- [ ] **Step 3: Implement the compact feature pack**
-
-Use clipped denominators (`1e-3`) and no learned statistics. Call the function from `build_features` for both train and test.
-
-- [ ] **Step 4: Screen with one seed**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 python src/exp_runner.py stage7 --seeds 42 --screen physical`
-
-Expected: candidate fold23/fold24 scores and deltas are printed. Retain the pack only if both deltas are positive.
-
-- [ ] **Step 5: Test and record**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_features.py tests/test_v6_eval.py`
-
-Update `docs/experiments.md` with accepted/rejected evidence and commit the feature pack only when accepted.
-
-### Task 5: Metric-aligned bounded search if prior candidates fail
+### Task 4: Three-seed final evaluator gate
 
 **Files:**
 - Modify: `src/v6_eval.py`
+- Modify: `src/exp_runner.py`
 - Modify: `tests/test_v6_eval.py`
 - Modify: `docs/experiments.md`
 
 **Interfaces:**
-- Produces: a bounded search over quantile alphas `{0.57, 0.60, 0.63}` and evaluation-aligned training weights `{uniform, 1 + y/cap}` with all other parameters frozen.
+- `run_stage7((42, 202, 777))` evaluates frozen v5 and exactly one weighted-potential candidate
+  with identical raw sources, features, validation targets, seeds, and post-processing.
+- Default `python src/exp_runner.py stage7` prints one final JSON result and exits `0` only when
+  `gate_scores()` passes.
 
-- [ ] **Step 1: Add failing tests for the exact candidate matrix**
+- [ ] **Step 1: Write the final-route and result-contract tests**
 
-Assert the matrix has exactly six unique candidates, preserves frozen base parameters, and contains no scale/floor tuning fields.
+Assert default stage7 selects only the weighted recipe, reports per-fold/per-group NMAE and FICR,
+compares exact actual targets, and returns non-zero for either-fold regression or mean gain below
+`0.0010`.
 
-- [ ] **Step 2: Run tests and verify failure**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_v6_eval.py -k candidate_matrix`
-
-- [ ] **Step 3: Implement and run one-seed bounded search**
-
-Run: `PYTHONDONTWRITEBYTECODE=1 python src/exp_runner.py stage7 --seeds 42 --screen metric`
-
-Expected: six candidate rows with both fold deltas; select only a both-fold winner.
-
-- [ ] **Step 4: Record and checkpoint evidence**
-
-Update `docs/experiments.md` and the performance-goal ledger. Do not promote a setting that wins only one fold.
-
-### Task 6: Three-seed final evaluator gate
-
-**Files:**
-- Modify: `src/v6_eval.py`
-- Modify: `docs/experiments.md`
-
-**Interfaces:**
-- `run_stage7((42, 202, 777))` evaluates the frozen v5 baseline and exactly one selected v6 candidate and prints a final JSON object.
-
-- [ ] **Step 1: Freeze the selected recipe constants**
-
-Store the winning model family, feature-pack flag, alpha/weight setting, and group blend weights as immutable literals in `v6_eval.py`; remove exploratory selection from the default stage7 path.
-
-- [ ] **Step 2: Run the canonical evaluator**
+- [ ] **Step 2: Run the canonical three-seed evaluator**
 
 Run: `PYTHONDONTWRITEBYTECODE=1 python src/exp_runner.py stage7`
 
-Expected: exit `0`, both deltas positive, mean delta at least `0.0010`, and final JSON `status` equal to `PASS`.
+Expected: exit `0`, both deltas positive, mean delta at least `0.0010`, and final JSON status
+`PASS`. If this fails, stop promotion and use only the bounded contingency candidates documented
+in the design; do not weaken the gate.
 
-- [ ] **Step 3: Run regression checks**
+- [ ] **Step 3: Run regression/static checks**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q`
+Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests`
 
 Run: `python -m compileall -q src tests`
 
-Expected: both commands succeed.
+Run: `black --check src tests && mypy src`
 
 - [ ] **Step 4: Record passing checkpoint and commit**
 
-Run `omx performance-goal checkpoint --slug wind-v6-dual-fold --status pass` with full fold scores/deltas and commit evaluator/recipe/docs using Lore trailers.
+Run `omx performance-goal checkpoint --slug wind-v6-dual-fold --status pass` with the complete
+three-seed fold scores/deltas and manifest keys. Commit evaluator/recipe/docs with Lore trailers.
 
-### Task 7: Production retraining and inference parity
+### Task 5: Production retraining and inference parity
 
 **Files:**
 - Modify: `src/train.py`
@@ -277,8 +257,11 @@ Run `omx performance-goal checkpoint --slug wind-v6-dual-fold --status pass` wit
 - Create: `tests/test_submission.py`
 
 **Interfaces:**
-- Training saves every selected model family with unambiguous prefixes and a `recipe.json` containing seeds, weights, feature hash, model files, floor ratios, and evaluator scores.
-- Inference loads only `recipe.json`, verifies model/feature hashes, blends selected families, applies floor10, and writes `submissions/submission.csv`.
+- Training imports the exact weighted-target implementation used by stage7 and saves the selected
+  models plus `recipe.json` containing calibration metadata, target/training hashes, seeds, feature
+  schema hash, rounds, model hashes, floor ratios, and final evaluator scores.
+- Inference loads only files named by `recipe.json`, verifies model/feature hashes, applies floor10,
+  and writes `submissions/submission.csv`.
 
 - [ ] **Step 1: Write failing metadata and submission-validator tests**
 
@@ -288,9 +271,12 @@ Assert required recipe keys, model-file existence, exact sample column order, 8,
 
 Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests/test_submission.py`
 
-- [ ] **Step 3: Make training and inference consume the frozen winning recipe**
+- [ ] **Step 3: Make training and inference consume the frozen weighted recipe**
 
-Reuse the exact feature function, params, seeds, target construction, family names, and blend weights confirmed by stage7. Include the final `2025-01-01 00:00` label row only if the separately evaluated boundary candidate passed both folds; otherwise preserve the frozen year split.
+Reuse the exact feature function, params, seeds, weighted target construction, grouping, and
+post-processing confirmed by stage7. Full training uses label-years 2022-2024 only; the
+`2025-01-01 00:00` boundary label remains excluded. Assert evaluator and production target hashes
+match for identical year inputs.
 
 - [ ] **Step 4: Retrain and generate the artifact**
 
@@ -308,7 +294,7 @@ Run: `git diff --check`
 
 Expected: all checks pass.
 
-### Task 8: Completion audit and handoff
+### Task 6: Completion audit and handoff
 
 **Files:**
 - Modify: `README.md`
@@ -323,7 +309,7 @@ Document `stage7`, full retraining/inference, the selected v6 recipe, both-fold 
 
 - [ ] **Step 2: Run the complete audit**
 
-Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q`
+Run: `PYTHONDONTWRITEBYTECODE=1 pytest -q tests`
 
 Run: `python -m compileall -q src tests`
 
