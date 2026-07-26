@@ -66,7 +66,7 @@ def build_cache():
     if not (CACHE / "train_base.parquet").exists():
         print("캐시 생성 중 (최초 1회)...")
         feat = build_features(TRAIN_DIR / "ldaps_train.csv", TRAIN_DIR / "gfs_train.csv",
-                              context=False)
+                              context=False, phys=False)
         feat.to_parquet(CACHE / "train_base.parquet")
         _slim_raw(TRAIN_DIR / "ldaps_train.csv", "ldaps").to_parquet(CACHE / "train_ldaps_raw.parquet")
         _slim_raw(TRAIN_DIR / "gfs_train.csv", "gfs").to_parquet(CACHE / "train_gfs_raw.parquet")

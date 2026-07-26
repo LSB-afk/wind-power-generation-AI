@@ -21,3 +21,6 @@ cache/
 
 # Local OMX workflow state
 .omx/
+
+# 로컬 에이전트 상태
+.omc/

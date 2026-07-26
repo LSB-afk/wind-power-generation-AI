@@ -144,12 +144,115 @@ def add_context(feat: pd.DataFrame, davail: pd.Series) -> pd.DataFrame:
     return pd.concat([feat, pd.DataFrame(new_cols, index=feat.index)], axis=1)
 
 
-def build_features(ldaps_path, gfs_path, context: bool = True) -> pd.DataFrame:
-    """예보 대상 시각(forecast_kst_dtm) 인덱스의 피처 테이블 생성."""
+def _veer(u1, v1, u2, v2, prefix):
+    """두 고도 풍향 사이각의 sin/cos (풍향 전단 = veer)."""
+    n = np.sqrt((u1**2 + v1**2) * (u2**2 + v2**2)) + 1e-6
+    return {f"{prefix}_cos": (u1 * u2 + v1 * v2) / n,
+            f"{prefix}_sin": (u1 * v2 - v1 * u2) / n}
+
+
+def build_phys_features(ldaps_path, gfs_path) -> pd.DataFrame:
+    """허브고도(117 m) 물리 피처 팩 — 전단지수·안정도·상층풍·환기율.
+
+    기존 피처가 쓰지 않던 원본 변수(700/500 hPa 바람, 850 hPa 기온·습도,
+    VRATE, 이슬점, 상층운)를 사용한다. 풍속의 고도 외삽은 멱법칙
+    `ws(z) = ws100 * (z/100)^alpha`, `alpha = ln(ws100/ws10)/ln(10)` 로,
+    대기 안정도가 이 alpha를 좌우하므로 안정도 지표를 함께 넣는다.
+    모든 컬럼은 `px_` 접두사를 쓴다 (기존 피처명과 충돌 없음).
+    """
+    eps = 0.5
+    g = pd.read_csv(gfs_path, encoding="utf-8-sig", parse_dates=["forecast_kst_dtm"])
+    ws10 = _wind_speed(g["heightAboveGround_10_10u"], g["heightAboveGround_10_10v"])
+    ws100 = _wind_speed(g["heightAboveGround_100_100u"], g["heightAboveGround_100_100v"])
+    gd = pd.DataFrame({"forecast_kst_dtm": g["forecast_kst_dtm"]})
+    gd["px_alpha"] = np.log(np.maximum(ws100, eps) / np.maximum(ws10, eps)) / np.log(10.0)
+    gd["px_ws117"] = ws100 * (1.17 ** gd["px_alpha"])
+    gd["px_ws117_cube"] = gd["px_ws117"] ** 3
+    rho = g["surface_0_sp"] / (287.05 * g["heightAboveGround_2_2t"])
+    gd["px_pdens117"] = 0.5 * rho * gd["px_ws117_cube"]
+    gd["px_ws700"] = _wind_speed(g["isobaricInhPa_700_u"], g["isobaricInhPa_700_v"])
+    gd["px_ws500"] = _wind_speed(g["isobaricInhPa_500_u"], g["isobaricInhPa_500_v"])
+    gd["px_ws850_ratio"] = _wind_speed(g["isobaricInhPa_850_u"],
+                                       g["isobaricInhPa_850_v"]) / np.maximum(ws100, eps)
+    # 안정도: 하층 기온감률이 클수록 불안정 → 연직 혼합 강화 → 전단 감소
+    gd["px_lapse_2_850"] = g["heightAboveGround_2_2t"] - g["isobaricInhPa_850_t"]
+    gd["px_lapse_850_700"] = g["isobaricInhPa_850_t"] - g["isobaricInhPa_700_t"]
+    gd["px_dpt_dep"] = g["heightAboveGround_2_2t"] - g["heightAboveGround_2_2d"]
+    gd["px_r850"] = g["isobaricInhPa_850_r"]
+    gd["px_vrate"] = g["planetaryBoundaryLayer_0_VRATE"]
+    gd["px_gustfac"] = g["surface_0_gust"] / np.maximum(ws10, eps)
+    gd["px_dswrf"] = g["surface_0_dswrf"]
+    gd["px_dlwrf"] = g["surface_0_dlwrf"]
+    gd["px_tp"] = g["surface_0_tp"]
+    for k, v in _veer(g["heightAboveGround_10_10u"], g["heightAboveGround_10_10v"],
+                      g["heightAboveGround_100_100u"], g["heightAboveGround_100_100v"],
+                      "px_veer_10_100").items():
+        gd[k] = v
+    for k, v in _veer(g["heightAboveGround_100_100u"], g["heightAboveGround_100_100v"],
+                      g["isobaricInhPa_850_u"], g["isobaricInhPa_850_v"],
+                      "px_veer_100_850").items():
+        gd[k] = v
+    gcols = [c for c in gd.columns if c.startswith("px_")]
+    gagg = gd.groupby("forecast_kst_dtm")[gcols].agg(["mean", "std"])
+    gagg.columns = [f"gfs_{c}_{s}" for c, s in gagg.columns]
+
+    l = pd.read_csv(ldaps_path, encoding="utf-8-sig", parse_dates=["forecast_kst_dtm"])
+    lws10 = _wind_speed(l["heightAboveGround_10_10u"], l["heightAboveGround_10_10v"])
+    lws50 = _wind_speed(l["heightAboveGround_50_50MUmax"], l["heightAboveGround_50_50MVmax"])
+    lws50min = _wind_speed(l["heightAboveGround_50_50MUmin"], l["heightAboveGround_50_50MVmin"])
+    lblws = _wind_speed(l["heightAboveGround_5_XBLWS"], l["heightAboveGround_5_YBLWS"])
+    ld = pd.DataFrame({"forecast_kst_dtm": l["forecast_kst_dtm"]})
+    ld["px_l_alpha"] = np.log(np.maximum(lws50, eps) / np.maximum(lws10, eps)) / np.log(5.0)
+    ld["px_l_ws117"] = lws50 * ((117.0 / 50.0) ** ld["px_l_alpha"])
+    ld["px_l_ws50min"] = lws50min
+    ld["px_l_ws50_range"] = lws50 - lws50min
+    ld["px_l_gustfac"] = lws50 / np.maximum(lws10, eps)
+    ld["px_l_blws_ratio"] = lblws / np.maximum(lws10, eps)
+    ld["px_l_dpt_dep"] = l["heightAboveGround_2_t"] - l["heightAboveGround_2_dpt"]
+    ld["px_l_q"] = l["heightAboveGround_2_q"]
+    ld["px_l_prmsl"] = l["meanSea_0_prmsl"]
+    ld["px_l_hcc"] = l["etc_0_hcc"]
+    ld["px_l_mcc"] = l["etc_0_mcc"]
+    ld["px_l_vlcdc"] = l["etc_0_VLCDC"]
+    ld["px_l_ndnsw"] = l["surface_0_NDNSW"]
+    ld["px_l_ndnlw"] = l["surface_0_NDNLW"]
+    ld["px_l_lssrate"] = l["surface_0_lssrate"]
+    ld["px_l_snol"] = l["surface_0_snol"]
+    lcols = [c for c in ld.columns if c.startswith("px_")]
+    lagg = ld.groupby("forecast_kst_dtm")[lcols].agg(["mean", "std"])
+    lagg.columns = [f"ldaps_{c}_{s}" for c, s in lagg.columns]
+
+    # 컬럼 집합은 데이터에 의존하지 않아야 한다 (train/test 정렬 보장)
+    return gagg.join(lagg, how="outer").sort_index()
+
+
+def build_features(ldaps_path, gfs_path, context: bool = True,
+                   phys: bool = True) -> pd.DataFrame:
+    """예보 대상 시각(forecast_kst_dtm) 인덱스의 피처 테이블 생성.
+
+    phys=False 는 v5 이전(276피처) 레거시 캐시 재현용이다.
+    """
     ldaps, davail = build_ldaps_features(ldaps_path)
     gfs = build_gfs_features(gfs_path)
     feat = ldaps.join(gfs, how="outer")
     feat = add_time_features(feat)
     if context:
         feat = add_context(feat, davail)
+    if phys:
+        feat = feat.join(build_phys_features(ldaps_path, gfs_path), how="left")
     return feat.sort_index()
+
+
+if __name__ == "__main__":
+    # 자체 점검: train/test 피처 컬럼이 어긋나면 추론이 조용히 깨진다.
+    from config import TEST_DIR, TRAIN_DIR
+
+    tr = build_features(TRAIN_DIR / "ldaps_train.csv", TRAIN_DIR / "gfs_train.csv")
+    te = build_features(TEST_DIR / "ldaps_test.csv", TEST_DIR / "gfs_test.csv")
+    assert list(tr.columns) == list(te.columns), "train/test 피처 컬럼 불일치"
+    assert len(tr.columns) == 348, f"피처 수 {len(tr.columns)} != 348"
+    for f in (tr, te):
+        px = f[[c for c in f.columns if "_px_" in c]]
+        assert np.isfinite(px.to_numpy(dtype=float)[~px.isna().to_numpy()]).all(), "물리 팩에 Inf"
+        assert (px["gfs_px_ws117_mean"].dropna() > 0).all(), "허브고도 풍속이 음수"
+    print(f"OK: train {tr.shape}, test {te.shape}, 컬럼 일치")
