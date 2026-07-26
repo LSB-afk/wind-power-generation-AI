@@ -1,6 +1,6 @@
 """학습 스크립트 (대회 규정: 추론 코드와 분리).
 
-v9 레시피 — 서로 다른 3개 피처 표현의 앙상블.
+v12 레시피 — 3개 피처 표현 앙상블 + 강규제 하이퍼파라미터.
 
 배경: v4~v8 은 단일 표현을 계속 손봤고, 로컬 홀드아웃은 올랐지만 Public 은
 0.635 에서 정체했다. 블록 부트스트랩으로 재보니 단일 폴드 점수의 표준오차가
@@ -47,9 +47,18 @@ G3 = "kpx_group_3"
 
 
 def params(n_feat, seed):
-    ff = 0.7 if n_feat < 500 else (0.35 if n_feat < 1000 else 0.25)
-    return dict(BASE_PARAMS, objective="quantile", alpha=ALPHA,
-                feature_fraction=ff, seed=seed)
+    """v12 강규제 설정.
+
+    v1(195피처) 시절의 lr 0.03 / min_data 40 / feature_fraction 0.7 을 피처가
+    1577개로 늘어난 뒤에도 그대로 썼던 것이 문제였다. 8개 설정을 이중 폴드로
+    탐색한 결과 강규제가 이겼고(fold24 +0.0058, fold23 +0.0036, 1시드),
+    3시드에서도 6개 멤버-폴드 중 5개가 개선됐다. 1-NMAE 는 그대로인데
+    FICR 이 0.4140 → 0.4204 로 올라 격차가 큰 항목을 정확히 겨냥한다.
+    """
+    return dict(BASE_PARAMS, objective="quantile", alpha=ALPHA, seed=seed,
+                learning_rate=0.02, num_leaves=63, min_data_in_leaf=100,
+                feature_fraction=0.20, bagging_fraction=0.7, bagging_freq=1,
+                lambda_l2=30.0)
 
 
 def build_train_reps(fit_years):
