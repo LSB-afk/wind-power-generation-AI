@@ -133,3 +133,50 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ──────────────────── 4번째 표현: 터빈 좌표 IDW 보간 ────────────────────
+
+def build_idw(ldaps_path, gfs_path) -> pd.DataFrame:
+    """격자를 펼치는 대신 **터빈 그룹 좌표로 거리가중 보간**한 표현.
+
+    full 표현이 격자를 그대로 나열해 모델이 공간 구조를 스스로 찾게 한다면,
+    이 표현은 터빈 위치라는 사전지식을 명시적으로 주입한다. 같은 원본에서
+    서로 다른 귀납 편향을 만들어 앙상블 다양성을 얻는 것이 목적이다.
+    """
+    from geo import idw_weights
+
+    frames = []
+    for path, source in ((ldaps_path, "ldaps"), (gfs_path, "gfs")):
+        df = pd.read_csv(path, encoding="utf-8-sig", parse_dates=["forecast_kst_dtm"])
+        df = pd.concat([df[["forecast_kst_dtm", "grid_id", "latitude", "longitude"]],
+                        _derive(df, source)], axis=1)
+        val_cols = [c for c in df.columns
+                    if c not in ("forecast_kst_dtm", "grid_id", "latitude", "longitude")]
+        w = idw_weights(df.drop_duplicates("grid_id")[["grid_id", "latitude", "longitude"]])
+        for v in val_cols:
+            wide = df.pivot_table(index="forecast_kst_dtm", columns="grid_id", values=v)
+            for g, ws in w.items():
+                col = (wide * ws.reindex(wide.columns).to_numpy()).sum(axis=1)
+                frames.append(col.rename(f"{source[0]}idw{g[-1]}_{v}"))
+    feat = pd.concat(frames, axis=1)
+    idx = feat.index
+    feat["hour_sin"] = np.sin(2 * np.pi * idx.hour / 24)
+    feat["hour_cos"] = np.cos(2 * np.pi * idx.hour / 24)
+    feat["doy_sin"] = np.sin(2 * np.pi * idx.dayofyear / 365.25)
+    feat["doy_cos"] = np.cos(2 * np.pi * idx.dayofyear / 365.25)
+    feat["lead_h"] = np.where(idx.hour == 0, 35, idx.hour + 11)
+    return feat.sort_index()
+
+
+def build_idw_cache():
+    for tag, (lp, gp) in {
+        "train": (TRAIN_DIR / "ldaps_train.csv", TRAIN_DIR / "gfs_train.csv"),
+        "test": (TEST_DIR / "ldaps_test.csv", TEST_DIR / "gfs_test.csv"),
+    }.items():
+        out = CACHE / f"idw_{tag}.parquet"
+        if out.exists():
+            continue
+        f = build_idw(lp, gp)
+        f.to_parquet(out)
+        print(f"idw {tag}: {f.shape[0]:,}행 x {f.shape[1]:,}피처")
