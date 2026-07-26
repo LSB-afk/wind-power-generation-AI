@@ -24,3 +24,7 @@ cache/
 
 # 로컬 에이전트 상태
 .omc/
+
+# 학습된 모델 바이너리 (435MB) — `python src/train.py` 로 재생성
+# 적합 파라미터(terrain_params.npz, v9_feature_cols.json)는 추적한다
+models/*.txt
