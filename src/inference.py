@@ -17,11 +17,13 @@ import features_full
 from config import CAPACITY_KWH, DATA_DIR, GROUPS, MODEL_DIR, ROOT, SUBMISSION_DIR, TEST_DIR
 from features import build_features
 from postprocess import apply_post
+from smooth import smooth_within_block
 from terrain import apply_terrain, load_terrain
 
 CACHE = ROOT / "cache"
 REPS = ("base", "full", "fullterr")
 SEEDS = (42, 202, 777)
+SMOOTH_HOURS = 3
 G12 = ["kpx_group_1", "kpx_group_2"]
 G3 = "kpx_group_3"
 
@@ -67,9 +69,15 @@ def main():
         preds[G3].append(np.clip(ensemble(f"v9_{rep}_pooled", Xp) * cap3, 0, cap3))
         print(f"  {rep}: 추론 완료")
 
+    # 발표분 블록 내 3시간 평활 — 시간별 독립 예측의 잡음 제거.
+    # 블록(01:00~익일 00:00) 밖과는 절대 섞지 않으므로 예측기준시점 규칙을 지킨다.
+    # 이중 폴드 검증: fold24 +0.0011, fold23 +0.0013 (FICR 양쪽 상승)
     for g in GROUPS:
-        sub[g] = apply_post(np.mean(preds[g], axis=0), CAPACITY_KWH[g],
-                            post[g]["scale"], post[g]["floor"])
+        cap = CAPACITY_KWH[g]
+        pred = apply_post(np.mean(preds[g], axis=0), cap,
+                          post[g]["scale"], post[g]["floor"])
+        pred = smooth_within_block(pred, pd.DatetimeIndex(t), SMOOTH_HOURS)
+        sub[g] = np.clip(np.maximum(pred, post[g]["floor"]), 0, cap)
 
     out = SUBMISSION_DIR / "submission.csv"
     # 제출 규격: forecast_id, forecast_kst_dtm 원본 유지, UTF-8
