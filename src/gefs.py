@@ -37,9 +37,19 @@ SITE_LAT, SITE_LON = 37.283, 128.963
 LATS = [37.0, 37.5, 38.0]
 LONS = [128.5, 129.0, 129.5]
 # 예보 대상 익일 01:00~익익일 00:00 KST = 00Z 런의 f016~f039
-FHOURS = list(range(16, 40))
+# GEFS 0.5도는 3시간 간격 — 존재하는 예보시간만 요청해 헛된 재시도를 없앤다
+FHOURS = [f for f in range(16, 40) if f % 3 == 0]
+# 사이트는 해발 약 1,000 m 산악이라 허브(지상 117 m)는 대략 890 hPa 에 해당한다.
+# 925/850 hPa 바람이 허브고도를 위아래로 감싸므로 10 m 바람보다 훨씬 좋은 대리변수다.
 WANT = ("UGRD:10 m above ground", "VGRD:10 m above ground",
+        "UGRD:1000 mb", "VGRD:1000 mb",
+        "UGRD:925 mb", "VGRD:925 mb",
+        "UGRD:850 mb", "VGRD:850 mb",
+        "HGT:925 mb", "HGT:850 mb",
         "GUST:surface", "TMP:2 m above ground", "PRES:surface")
+# 앙상블 스프레드(gespr)에서 가져올 변수 — 예보 불확실성 지표
+WANT_SPR = ("UGRD:925 mb", "VGRD:925 mb", "UGRD:850 mb", "VGRD:850 mb",
+            "UGRD:10 m above ground", "VGRD:10 m above ground")
 
 
 def _url(date: str, fh: int) -> str:
@@ -68,7 +78,7 @@ def _get(url, lo=None, hi=None, tries=4, timeout=90):
     return None
 
 
-def _fetch_records(url: str) -> dict:
+def _fetch_records(url: str, want=None) -> dict:
     """.idx 로 필요한 변수 구간을 찾아, **인접 레코드는 한 번에** 받는다.
 
     변수마다 따로 요청하면 하루 120회가 넘어 타임아웃이 잦다.
@@ -81,7 +91,8 @@ def _fetch_records(url: str) -> dict:
         return {}
     lines = [l for l in raw.decode().strip().split("\n") if l]
     starts = [int(l.split(":")[1]) for l in lines]
-    want = [i for i, l in enumerate(lines) if any(w in l for w in WANT)]
+    keys = WANT if want is None else want
+    want = [i for i, l in enumerate(lines) if any(w in l for w in keys)]
     if not want:
         return {}
     lo = starts[min(want)]
@@ -97,7 +108,14 @@ def _fetch_records(url: str) -> dict:
         for ds in cfgrib.open_datasets(str(tmp), backend_kwargs={"indexpath": ""}):
             for v in ds.data_vars:
                 sel = ds[v].sel(latitude=LATS, longitude=LONS, method="nearest")
-                out[v] = np.asarray(sel.values, dtype=np.float32)
+                lev = sel.coords.get("isobaricInhPa")
+                arr = np.asarray(sel.values, dtype=np.float32)
+                if arr.ndim == 3 and lev is not None:
+                    # 기압면 변수는 고도별로 분리한다 (1000/925/850 hPa)
+                    for i, hpa in enumerate(np.atleast_1d(lev.values)):
+                        out[f"{v}{int(hpa)}"] = arr[i]
+                else:
+                    out[v] = arr
             ds.close()
     except Exception:
         pass
@@ -113,12 +131,15 @@ def fetch_day(date: str) -> pd.DataFrame:
         rec = _fetch_records(_url(date, fh))
         if not rec:
             continue
+        spr = _fetch_records(_spread_url(date, fh), WANT_SPR)
         # 00Z + fh 시간 = UTC → KST(+9)
         t = pd.Timestamp(date) + pd.Timedelta(hours=fh + 9)
         flat = {}
         for key, arr in rec.items():
             flat[f"gefs_{key}_mean"] = float(np.mean(arr))
             flat[f"gefs_{key}_c"] = float(arr[1, 1])   # 사이트 최근접 격자
+        for key, arr in spr.items():
+            flat[f"gefsspr_{key}_c"] = float(arr[1, 1])
         rows[t] = flat
     return pd.DataFrame.from_dict(rows, orient="index").sort_index()
 
@@ -147,7 +168,42 @@ def probe():
     print(df.head(3).to_string())
 
 
+def fetch_all(workers=24):
+    """전 기간 취득. 월 단위로 저장해 중단되어도 이어받는다.
+
+    대상 날짜 = 예보 발표일. 발표일 D 의 00Z 런이 D+1 01:00 ~ D+2 00:00 KST 를 덮으므로
+    학습(2022-01-01~2024-12-31)·평가(2025 전체) 대상 시각을 모두 덮으려면
+    2021-12-31 ~ 2025-12-31 발표분이 필요하다.
+    """
+    out_dir = CACHE / "gefs_raw"
+    out_dir.mkdir(exist_ok=True)
+    months = pd.date_range("2021-12-01", "2025-12-01", freq="MS")
+    for m0 in months:
+        path = out_dir / f"gefs_{m0:%Y%m}.parquet"
+        if path.exists():
+            continue
+        days = pd.date_range(max(m0, pd.Timestamp("2021-12-31")),
+                             min(m0 + pd.offsets.MonthEnd(0), pd.Timestamp("2025-12-31")))
+        if len(days) == 0:
+            continue
+        t0 = time.time()
+        df = fetch_range([d.strftime("%Y%m%d") for d in days], workers)
+        if df.empty:
+            print(f"  {m0:%Y-%m} 실패", flush=True)
+            continue
+        df.to_parquet(path)
+        print(f"  {m0:%Y-%m}: {len(df)}시각, {time.time()-t0:.0f}초", flush=True)
+    parts = sorted(out_dir.glob("gefs_*.parquet"))
+    if parts:
+        all_df = pd.concat([pd.read_parquet(f) for f in parts]).sort_index()
+        all_df = all_df[~all_df.index.duplicated()]
+        all_df.to_parquet(CACHE / "gefs_all.parquet")
+        print(f"\n전체 병합: {all_df.shape[0]:,}시각 x {all_df.shape[1]}변수 → cache/gefs_all.parquet")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "probe"
     if mode == "probe":
         probe()
+    elif mode == "fetch":
+        fetch_all(int(sys.argv[2]) if len(sys.argv) > 2 else 24)
