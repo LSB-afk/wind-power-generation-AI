@@ -5,6 +5,8 @@
 
 - 대회 링크: https://dacon.io/competitions/official/236727/overview/description
 - 대회 기간: 2026.07.06 ~ 2026.08.14 (1차 제출 마감 08.14 10:00)
+- **현재 Public 0.64276** (1-NMAE 0.86877, FICR 0.41675) — 진행 상황과 남은 계획은
+  [docs/status.md](docs/status.md), 전체 실험 로그는 [docs/experiments.md](docs/experiments.md)
 
 ## 예측 대상
 
