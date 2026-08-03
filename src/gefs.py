@@ -41,12 +41,13 @@ LONS = [128.5, 129.0, 129.5]
 FHOURS = [f for f in range(16, 40) if f % 3 == 0]
 # 사이트는 해발 약 1,000 m 산악이라 허브(지상 117 m)는 대략 890 hPa 에 해당한다.
 # 925/850 hPa 바람이 허브고도를 위아래로 감싸므로 10 m 바람보다 훨씬 좋은 대리변수다.
-WANT = ("UGRD:10 m above ground", "VGRD:10 m above ground",
-        "UGRD:1000 mb", "VGRD:1000 mb",
-        "UGRD:925 mb", "VGRD:925 mb",
-        "UGRD:850 mb", "VGRD:850 mb",
-        "HGT:925 mb", "HGT:850 mb",
-        "GUST:surface", "TMP:2 m above ground", "PRES:surface")
+#
+# 취득 속도를 좌우하는 것은 변수 개수가 아니라 **바이트 범위의 폭**이다.
+# GRIB 레코드는 파일 안에 흩어져 있어, 지표~10 m 변수까지 넣으면 범위가 5.4 MB 로
+# 벌어진다. 반면 850/925 hPa 바람은 1.6 MB 연속 구간에 몰려 있고, 표본 검정에서
+# 풍속 MAE 개선의 대부분(-20~22%p 중 -20%p)이 이 구간에서 나왔다.
+# 사이의 레코드(각 고도의 기온·습도·지위고도)는 같은 범위에 딸려 와 덤으로 쓴다.
+WANT = ("UGRD:925 mb", "VGRD:925 mb", "UGRD:850 mb", "VGRD:850 mb")
 # 앙상블 스프레드(gespr)에서 가져올 변수 — 예보 불확실성 지표
 WANT_SPR = ("UGRD:925 mb", "VGRD:925 mb", "UGRD:850 mb", "VGRD:850 mb",
             "UGRD:10 m above ground", "VGRD:10 m above ground")
@@ -74,7 +75,7 @@ def _get(url, lo=None, hi=None, tries=4, timeout=90):
         except Exception:
             if k == tries - 1:
                 return None
-            time.sleep(1.5 * (k + 1))
+            time.sleep(3.0 * (k + 1))   # S3 스로틀링 회복 대기
     return None
 
 
@@ -124,14 +125,17 @@ def _fetch_records(url: str, want=None) -> dict:
     return out
 
 
+WITH_SPREAD = False   # 스프레드는 요청 수를 2배로 만드는데 이득은 2%p 남짓이라 기본 off
+
+
 def fetch_day(date: str) -> pd.DataFrame:
-    """하루치(f016~f039) 를 예보 대상 KST 시각 인덱스로 반환."""
+    """하루치(f018~f039) 를 예보 대상 KST 시각 인덱스로 반환."""
     rows = {}
     for fh in FHOURS:
         rec = _fetch_records(_url(date, fh))
         if not rec:
             continue
-        spr = _fetch_records(_spread_url(date, fh), WANT_SPR)
+        spr = _fetch_records(_spread_url(date, fh), WANT_SPR) if WITH_SPREAD else {}
         # 00Z + fh 시간 = UTC → KST(+9)
         t = pd.Timestamp(date) + pd.Timedelta(hours=fh + 9)
         flat = {}
@@ -144,7 +148,7 @@ def fetch_day(date: str) -> pd.DataFrame:
     return pd.DataFrame.from_dict(rows, orient="index").sort_index()
 
 
-def fetch_range(dates, workers=8) -> pd.DataFrame:
+def fetch_range(dates, workers=6) -> pd.DataFrame:
     with ThreadPoolExecutor(workers) as ex:
         parts = list(ex.map(fetch_day, dates))
     parts = [p for p in parts if len(p)]
@@ -168,7 +172,7 @@ def probe():
     print(df.head(3).to_string())
 
 
-def fetch_all(workers=24):
+def fetch_all(workers=6):
     """전 기간 취득. 월 단위로 저장해 중단되어도 이어받는다.
 
     대상 날짜 = 예보 발표일. 발표일 D 의 00Z 런이 D+1 01:00 ~ D+2 00:00 KST 를 덮으므로
@@ -187,6 +191,7 @@ def fetch_all(workers=24):
         if len(days) == 0:
             continue
         t0 = time.time()
+        print(f"  {m0:%Y-%m} 시작 ({len(days)}일)...", flush=True)
         df = fetch_range([d.strftime("%Y%m%d") for d in days], workers)
         if df.empty:
             print(f"  {m0:%Y-%m} 실패", flush=True)
@@ -206,4 +211,4 @@ if __name__ == "__main__":
     if mode == "probe":
         probe()
     elif mode == "fetch":
-        fetch_all(int(sys.argv[2]) if len(sys.argv) > 2 else 24)
+        fetch_all(int(sys.argv[2]) if len(sys.argv) > 2 else 6)
