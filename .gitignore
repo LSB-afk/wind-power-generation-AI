@@ -29,5 +29,11 @@ cache/
 # 적합 파라미터(terrain_params.npz, v9_feature_cols.json)는 추적한다
 models/*.txt
 
-# GEFS 원본 캐시 (src/gefs.py fetch 로 재생성)
-cache/gefs_raw/
+# 외부 데이터(NOAA GEFS)는 추적한다 — 대회 규칙 4항이 "사용한 모든 외부 데이터
+# 파일" 제출을 요구하고, 5.6MB 로 작다. 대회 제공 데이터에서 파생된 대용량
+# 캐시(full_train 293MB 등)만 제외한다.
+!cache/gefs_raw/
+!cache/gefs_raw/*.parquet
+!cache/gefs_all.parquet
+!cache/gefs_hourly.parquet
+!cache/gefs_probe.parquet
